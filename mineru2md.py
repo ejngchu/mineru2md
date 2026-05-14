@@ -1240,6 +1240,11 @@ def main():
     if "--help-languages" in sys.argv:
         show_help_languages()
 
+    # Fix UTF-8 encoding for stdout on Windows
+    if sys.platform == "win32":
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Convert files or URLs to markdown using MinerU APIs. "
                     "Auto-routes between Lightweight Agent API (no token needed) "
