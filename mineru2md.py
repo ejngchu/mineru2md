@@ -15,7 +15,7 @@ Precision API (fallback):
 
 Usage:
     python mineru2md.py --file <path>           # File upload mode (auto-routed)
-    python mineru2md.py --url <url>             # URL mode (Precision API)
+    python mineru2md.py --url <url>             # URL mode (auto-routed for articles)
     python mineru2md.py --file <path> --output <output.md>
 
     # Batch mode (multiple files/URLs)
@@ -29,8 +29,16 @@ Usage:
     # Force Precision API for compatible files
     python mineru2md.py --file ./doc.pdf --force-precision
 
+    # Print to stdout instead of saving
+    python mineru2md.py --file ./doc.pdf --print
+    python mineru2md.py --url https://example.com/article --print
+
+    # Add timestamp to output filename
+    python mineru2md.py --url https://example.com/article --timestamp
+
 Environment:
     MINERU_TOKEN - API token for authentication (Bearer token). Only needed for Precision API.
+                   Article URLs try Lightweight API first (no token), fallback to Precision.
 """
 
 import argparse
@@ -148,19 +156,14 @@ def determine_model_version(filename_or_url, is_url=False):
     """
     Determine model version based on file extension or URL.
 
-    For HTML files or common HTML URLs (wechat, ofweek, etc.), use MinerU-HTML.
-    For PDFs, documents, images, use vlm.
+    For HTML files or URLs pointing to web pages (no downloadable file extension
+    or .html/.htm extension), use MinerU-HTML. For PDFs, documents, images, use vlm.
     """
     if is_url:
-        url_lower = filename_or_url.lower()
-        # Check for HTML URLs
-        if any(pattern in url_lower for pattern in [
-            ".html", ".htm", "mp.weixin.qq.com", "mp.ofweek.com",
-            "news.163.com", "baijiahao.baidu.com", "toutiao.com",
-            "zhihu.com", "xiaohongshu.com", "weibo.com"
-        ]):
-            return "MinerU-HTML"
-        return "vlm"
+        if _url_has_file_extension(filename_or_url):
+            return "vlm"
+        # URL has no downloadable extension, or is .html/.htm → MinerU-HTML
+        return "MinerU-HTML"
     else:
         ext = extract_file_extension(filename_or_url)
         html_extensions = {"html", "htm"}
@@ -637,16 +640,17 @@ def download_and_extract(zip_url, token, original_filename, output_dir=None):
 
     tmp_path = None
     try:
+        # Stream download to temp file (write inside the NamedTemporaryFile context)
         with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
             tmp_path = tmp.name
+            with requests.get(zip_url, headers=headers, timeout=120, stream=True) as response:
+                if response.status_code != 200:
+                    print(f"Error: Failed to download zip. Status: {response.status_code}")
+                    raise MinerUError(f"Failed to download zip. Status: {response.status_code}")
 
-        with requests.get(zip_url, headers=headers, timeout=120, stream=True) as response:
-            if response.status_code != 200:
-                print(f"Error: Failed to download zip. Status: {response.status_code}")
-                raise MinerUError(f"Failed to download zip. Status: {response.status_code}")
-
-            for chunk in response.iter_content(chunk_size=8192):
-                tmp.write(chunk)
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        tmp.write(chunk)
 
         print(f"[Download] Downloaded to temp file: {tmp_path}")
 
@@ -992,9 +996,23 @@ def parse_with_auto_routing(file_path_or_url, token, optional_params,
         tuple: (markdown_content, original_filename, output_dir)
     """
     if is_url:
-        # URLs always use Precision API (cannot check size/page count for remote files)
-        print(f"[Route] Using Precision API (URL mode)")
-        return url_mode(file_path_or_url, token, optional_params, output_dir=output_dir)
+        # URLs: direct file URLs (pdf, png, etc.) → Precision API only
+        # Article URLs (no file extension, or .html/.htm) → try Lightweight API first, fallback Precision
+        if force_precision or _url_has_file_extension(file_path_or_url):
+            print(f"[Route] Using Precision API (URL mode)")
+            return url_mode(file_path_or_url, token, optional_params, output_dir=output_dir)
+        else:
+            print(f"[Route] Attempting Lightweight API for article URL...")
+            try:
+                result = lightweight_url_mode(file_path_or_url, optional_params, output_dir=output_dir)
+                print(f"[Route] Lightweight API succeeded")
+                return result
+            except MinerUError as e:
+                print(f"[Route] Lightweight API failed: {e}")
+                print(f"[Route] Falling back to Precision API...")
+                if token is None:
+                    token = get_token()
+                return url_mode(file_path_or_url, token, optional_params, output_dir=output_dir)
 
     # File mode - use routing decision helper
     api_type, reason = get_routing_decision(file_path_or_url, force_precision)
@@ -1004,6 +1022,60 @@ def parse_with_auto_routing(file_path_or_url, token, optional_params,
         return lightweight_file_mode(file_path_or_url, optional_params, output_dir=output_dir)
     else:
         return upload_file_mode(file_path_or_url, token, optional_params, output_dir=output_dir)
+
+
+def extract_title(md_content):
+    """
+    Extract the first level-1 heading (# ) from markdown content to use as filename.
+
+    Returns:
+        str or None: Sanitized title suitable for use as filename, or None if no heading found.
+    """
+    match = re.search(r'^#\s+(.+)$', md_content, re.MULTILINE)
+    if match:
+        title = match.group(1).strip()
+        # Remove or replace characters invalid in filenames
+        title = re.sub(r'[\\/:*?"<>|]', '_', title)
+        # Remove leading/trailing whitespace and dots
+        title = title.strip().strip('.')
+        # Truncate to reasonable length
+        if len(title) > 100:
+            title = title[:100].rstrip()
+        if not title:
+            return None
+        return title
+    return None
+
+
+def _url_has_file_extension(url):
+    """Check if URL path ends with a recognizable file extension.
+
+    URLs pointing to downloadable documents (PDF, images, Office docs) should
+    keep the URL-derived filename. URLs pointing to web articles or .html/.htm
+    pages should use the document title instead.
+    """
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    last_seg = path.split("/")[-1] if "/" in path else ""
+    ext_match = re.search(r'\.([a-zA-Z]{2,5})$', last_seg)
+    if not ext_match:
+        return False
+    ext = ext_match.group(1).lower()
+    # .html/.htm pages are web articles, not direct file downloads
+    download_extensions = {"pdf", "png", "jpg", "jpeg", "jp2", "webp", "gif", "bmp",
+                           "docx", "pptx", "xlsx", "doc", "ppt", "xls"}
+    return ext in download_extensions
+
+
+def _apply_timestamp(output_path):
+    """Prepend current date (YYYY-MM-DD) to the output filename."""
+    date_prefix = datetime.now().strftime("%Y-%m-%d ")
+    parent = os.path.dirname(output_path)
+    basename = os.path.basename(output_path)
+    new_name = date_prefix + basename
+    if parent:
+        return os.path.join(parent, new_name)
+    return new_name
 
 
 def save_markdown(content, output_path):
@@ -1028,10 +1100,15 @@ def generate_output_filename(input_path, is_url=False, output_dir=None):
         else:
             filename = url_part + ".md"
     else:
-        # For file path, use the base name
+        # For file path or title, use the base name
         basename = os.path.basename(input_path)
         if "." in basename:
-            filename = basename.rsplit(".", 1)[0] + ".md"
+            name_part, _, ext = basename.rpartition(".")
+            # Only strip if the last part looks like a file extension (alphabetic, 2-5 chars)
+            if re.match(r'^[a-zA-Z]{2,5}$', ext):
+                filename = name_part + ".md"
+            else:
+                filename = basename + ".md"
         else:
             filename = basename + ".md"
 
@@ -1040,12 +1117,14 @@ def generate_output_filename(input_path, is_url=False, output_dir=None):
     return filename
 
 
-def process_batch(file_list, token, optional_params, output_dir, is_url=False, force_precision=False):
+def process_batch(file_list, token, optional_params, output_dir, is_url=False, force_precision=False,
+                  use_title_for_url=False, no_save=False, timestamp=False):
     """
     Process multiple files or URLs in batch.
 
     For files, each item is auto-routed to Lightweight or Precision API
-    based on file characteristics. URLs always use Precision API.
+    based on file characteristics. Article URLs try Lightweight API first,
+    falling back to Precision API. File URLs use Precision API directly.
     """
     results = []
     total = len(file_list)
@@ -1059,9 +1138,33 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
         print("-" * 40)
 
         try:
+            title = None
             if is_url:
-                # URLs always use Precision API
-                md_content, original_filename, _ = url_mode(item, token, optional_params, output_dir=output_dir)
+                # Article URLs try Lightweight API first, fallback to Precision
+                if not force_precision and not _url_has_file_extension(item):
+                    try:
+                        md_content, original_filename, _ = lightweight_url_mode(
+                            item, optional_params, output_dir=output_dir)
+                    except MinerUError:
+                        # Fallback to Precision API
+                        if token is None:
+                            token = get_token()
+                        md_content, original_filename, _ = url_mode(
+                            item, token, optional_params, output_dir=output_dir)
+                else:
+                    # File URLs always need Precision API
+                    if token is None:
+                        token = get_token()
+                    md_content, original_filename, _ = url_mode(
+                        item, token, optional_params, output_dir=output_dir)
+
+                # Use document title only for article URLs (no file extension)
+                if use_title_for_url and not _url_has_file_extension(item):
+                    title = extract_title(md_content)
+                    if title:
+                        original_filename = title
+
+                output_path = generate_output_filename(original_filename, is_url=not title, output_dir=output_dir)
             else:
                 # Auto-route files based on characteristics
                 api_type, reason = get_routing_decision(item, force_precision)
@@ -1072,8 +1175,19 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
                 else:
                     md_content, original_filename, _ = upload_file_mode(item, token, optional_params, output_dir=output_dir)
 
-            output_path = generate_output_filename(original_filename, is_url=is_url, output_dir=output_dir)
-            save_markdown(md_content, output_path)
+                output_path = generate_output_filename(original_filename, is_url=False, output_dir=output_dir)
+
+            if timestamp:
+                output_path = _apply_timestamp(output_path)
+
+            if no_save:
+                print(f"\n{'='*50}")
+                print(f"--- {original_filename} ---")
+                print(f"{'='*50}")
+                print(md_content)
+            else:
+                save_markdown(md_content, output_path)
+
             results.append({"status": "success", "input": item, "output": output_path})
 
         except KeyboardInterrupt:
@@ -1159,6 +1273,15 @@ Examples:
   # Set cache tolerance (seconds)
   python mineru2md.py --url https://example.com/doc.pdf --cache-tolerance 1800
 
+  # Print markdown to stdout instead of saving to file
+  python mineru2md.py --file ./document.pdf --print
+
+  # Prepend date to output filename
+  python mineru2md.py --file ./document.pdf --timestamp
+
+  # Print with title-based filename for URL (no save)
+  python mineru2md.py --url https://example.com/doc.pdf --print --timestamp
+
 Environment:
   MINERU_TOKEN - API token for authentication (Bearer token). Only needed for Precision API.
         """
@@ -1201,6 +1324,12 @@ Environment:
     parser.add_argument("--force-precision", action="store_true",
                         help="Force using Precision API even for lightweight-compatible files")
 
+    # Output options
+    parser.add_argument("--print", action="store_true",
+                        help="Print markdown content to stdout instead of saving to file")
+    parser.add_argument("--timestamp", action="store_true",
+                        help="Prepend current date (YYYY-MM-DD) to output filename")
+
     # Polling options
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                         help=f"Polling timeout in seconds (default: {DEFAULT_TIMEOUT})")
@@ -1229,18 +1358,22 @@ Environment:
                 token = get_token()
 
             process_batch(args.files, token, optional_params, args.output_dir,
-                         is_url=False, force_precision=args.force_precision)
+                         is_url=False, force_precision=args.force_precision,
+                         use_title_for_url=False, no_save=args.print, timestamp=args.timestamp)
 
         elif args.urls:
-            # Batch URL mode - always Precision API
-            token = get_token()
+            # Batch URL mode - article URLs try Lightweight first
             if args.output and not args.output_dir:
                 raise MinerUError("--output is only valid for single URL. Use --output-dir for batch processing.")
-            process_batch(args.urls, token, optional_params, args.output_dir, is_url=True)
+            process_batch(args.urls, None, optional_params, args.output_dir, is_url=True,
+                          use_title_for_url=True, no_save=args.print, timestamp=args.timestamp)
 
         elif args.file:
             # Single file mode - auto-route
             output_path = args.output if args.output else generate_output_filename(args.file, output_dir=args.output_dir)
+
+            if args.timestamp and not args.output:
+                output_path = _apply_timestamp(output_path)
 
             api_type, reason = get_routing_decision(args.file, args.force_precision)
             print(f"[Route] Using {'Precision' if api_type == 'precision' else 'Lightweight'} API ({reason})")
@@ -1251,24 +1384,52 @@ Environment:
                 token = get_token()
                 md_content, original_filename, _ = upload_file_mode(args.file, token, optional_params, output_dir=args.output_dir)
 
-            save_markdown(md_content, output_path)
-
-            print(f"\n{'='*50}")
-            print(f"Conversion complete!")
-            print(f"Output: {output_path}")
-            print(f"{'='*50}")
+            if args.print:
+                print(f"\n{'='*50}")
+                print(f"--- {original_filename} ---")
+                print(f"{'='*50}")
+                print(md_content)
+            else:
+                save_markdown(md_content, output_path)
+                print(f"\n{'='*50}")
+                print(f"Conversion complete!")
+                print(f"Output: {output_path}")
+                print(f"{'='*50}")
 
         elif args.url:
-            # Single URL mode - always Precision API
-            token = get_token()
-            output_path = args.output if args.output else generate_output_filename(args.url, is_url=True, output_dir=args.output_dir)
-            md_content, original_filename, _ = url_mode(args.url, token, optional_params, output_dir=args.output_dir)
-            save_markdown(md_content, output_path)
+            # Single URL mode - auto-routed: article URLs try Lightweight first
+            md_content, original_filename, _ = parse_with_auto_routing(
+                args.url, token=None, optional_params=optional_params,
+                is_url=True, force_precision=args.force_precision,
+                output_dir=args.output_dir)
 
-            print(f"\n{'='*50}")
-            print(f"Conversion complete!")
-            print(f"Output: {output_path}")
-            print(f"{'='*50}")
+            if args.output:
+                output_path = args.output
+            else:
+                # Use document title only for article URLs (no file extension)
+                if not _url_has_file_extension(args.url):
+                    title = extract_title(md_content)
+                    if title:
+                        output_path = generate_output_filename(title, is_url=False, output_dir=args.output_dir)
+                    else:
+                        output_path = generate_output_filename(args.url, is_url=True, output_dir=args.output_dir)
+                else:
+                    output_path = generate_output_filename(args.url, is_url=True, output_dir=args.output_dir)
+
+            if args.timestamp and not args.output:
+                output_path = _apply_timestamp(output_path)
+
+            if args.print:
+                print(f"\n{'='*50}")
+                print(f"--- {original_filename} ---")
+                print(f"{'='*50}")
+                print(md_content)
+            else:
+                save_markdown(md_content, output_path)
+                print(f"\n{'='*50}")
+                print(f"Conversion complete!")
+                print(f"Output: {output_path}")
+                print(f"{'='*50}")
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")

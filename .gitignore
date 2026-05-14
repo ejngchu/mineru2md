@@ -1,4 +1,15 @@
-# Keep directory structure but exclude files
+# Python
+__pycache__/
+*.pyc
+
+# Sisyphus workspace
+.sisyphus/
+
+# Keep samples directory structure but exclude files
 samples/*
 !samples/images/
 samples/images/*
+
+# Generated test output markdown files (not README)
+*.md
+!README.md
