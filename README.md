@@ -286,6 +286,23 @@ md_content, filename, _ = lightweight_file_mode(
 | Excel | `.xlsx` | ✅ ≤10MB, ≤20 pages | ✅ |
 | HTML | `.html, .htm` | ❌ | ✅ |
 
+## OpenCode Skill Integration
+
+This project can be used as an [OpenCode](https://github.com/call0n3/opencode) skill for seamless image-to-markdown conversion within the OpenCode assistant.
+
+**Skill directory**: `~/.config/opencode/skills/mineru2md/`
+
+**Structure**:
+```
+~/.config/opencode/skills/mineru2md/
+├── SKILL.md          # Skill definition & user intent mapping
+└── mineru2md.py      # Main script (symlinked or copied from repo)
+```
+
+**Loading the skill**: When you send an image or screenshot and want to extract content as markdown, OpenCode automatically loads the mineru2md skill and routes your request to the appropriate CLI command.
+
+**Token persistence**: The skill saves your Precision API token to `~/.config/opencode/skills/mineru2md/config.json` so you only need to enter it once.
+
 ---
 
 ## License

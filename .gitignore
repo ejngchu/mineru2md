@@ -13,3 +13,4 @@ samples/images/*
 # Generated test output markdown files (not README)
 *.md
 !README.md
+!SKILL.md
