@@ -1,0 +1,4 @@
+# Keep directory structure but exclude files
+samples/*
+!samples/images/
+samples/images/*
