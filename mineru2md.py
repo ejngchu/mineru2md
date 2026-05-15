@@ -1279,7 +1279,14 @@ def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
 
     # Build combined payload
     headers = get_headers(token)
-    model_version = determine_model_version(file_paths[0])  # Use first file's model
+
+    # All files in a batch must use the same model_version
+    model_versions = {determine_model_version(fp) for fp in file_paths}
+    if len(model_versions) > 1:
+        # Split by model_version - warn and use the first one's model
+        print(f"  [Warning] Mixed file types in batch require different models ({model_versions}). "
+              f"Using '{list(model_versions)[0]}' for all.")
+    model_version = list(model_versions)[0]
     files_data = []
     for fp in file_paths:
         filename = os.path.basename(fp)
@@ -1321,10 +1328,11 @@ def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
             upload_response = make_request_with_retry("PUT", upload_urls[i], data=f)
 
         if upload_response.status_code != 200:
-            print(f"  [Warning] Upload failed for {filename}: HTTP {upload_response.status_code}")
-        else:
-            size_mb = get_file_size_mb(fp)
-            print(f"  OK ({size_mb:.1f}MB)")
+            msg = f"Upload failed for {filename}: HTTP {upload_response.status_code}"
+            print(f"  [Error] {msg}")
+            raise MinerUError(msg)
+        size_mb = get_file_size_mb(fp)
+        print(f"  OK ({size_mb:.1f}MB)")
 
     print(f"[Batch Upload] All files uploaded. Polling for results...")
 
@@ -1344,8 +1352,9 @@ def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
         data = result["data"]
         extract_results = data.get("extract_result", [])
 
-        if not extract_results:
-            print(f"\r[{format_time(elapsed)}] Waiting for results...", end="", flush=True)
+        if len(extract_results) < len(file_paths):
+            # Not all files have results yet (still being detected after upload)
+            print(f"\r[{format_time(elapsed)}] Waiting for files ({len(extract_results)}/{len(file_paths)})...", end="", flush=True)
             time.sleep(POLL_INTERVAL)
             continue
 
