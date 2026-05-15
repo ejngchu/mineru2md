@@ -1432,30 +1432,22 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
     print(f"Batch Processing: {total} item(s)")
     print(f"{'='*50}\n")
 
-    # For file mode, pre-scan routing decisions to batch precision files
-    precision_files = []
-    lightweight_files = []
+    # File mode — all files go through Precision batch upload directly
     if not is_url:
-        for item in file_list:
-            api_type, _ = get_routing_decision(item, force_precision)
-            if api_type == 'lightweight':
-                lightweight_files.append(item)
-            else:
-                precision_files.append(item)
+        file_list_str = ", ".join(os.path.basename(f) for f in file_list)
+        print(f"  Files: {file_list_str}")
 
-    # Process precision files in a true batch (single API call)
-    if precision_files:
-        print(f"\n[Batch] Processing {len(precision_files)} precision file(s) in a single batch...")
         try:
             if token is None:
                 token = get_token()
-            batch_results = _batch_upload_and_poll(precision_files, token, optional_params, output_dir)
-            for br in batch_results:
+            batch_results = _batch_upload_and_poll(file_list, token, optional_params, output_dir)
+            for i, br in enumerate(batch_results, 1):
                 original_filename = br["name"]
                 output_path = generate_output_filename(original_filename, is_url=False, output_dir=output_dir)
                 if timestamp:
                     output_path = _apply_timestamp(output_path)
                 if br["status"] == "success":
+                    print(f"[{i}/{total}] {original_filename}: OK")
                     if no_save:
                         print(f"\n{'='*50}")
                         print(f"--- {original_filename} ---")
@@ -1465,44 +1457,11 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
                         save_markdown(br["md"], output_path)
                     results.append({"status": "success", "input": br["file"], "output": output_path})
                 else:
-                    print(f"  Error: {br['error']}")
+                    print(f"[{i}/{total}] {original_filename}: FAILED — {br['error']}")
                     results.append({"status": "failed", "input": br["file"], "error": br["error"]})
         except Exception as e:
-            for fp in precision_files:
+            for fp in file_list:
                 results.append({"status": "failed", "input": fp, "error": str(e)})
-        print()
-
-    # Process lightweight files individually
-    for i, item in enumerate(lightweight_files, 1):
-        print(f"[{i}/{len(lightweight_files)}] Processing: {item}")
-        print("-" * 40)
-
-        try:
-            api_type, reason = get_routing_decision(item, force_precision)
-            print(f"[Route] Using Lightweight API ({reason})")
-
-            md_content, original_filename, _ = lightweight_file_mode(item, optional_params, output_dir=output_dir)
-            output_path = generate_output_filename(original_filename, is_url=False, output_dir=output_dir)
-
-            if timestamp:
-                output_path = _apply_timestamp(output_path)
-
-            if no_save:
-                print(f"\n{'='*50}")
-                print(f"--- {original_filename} ---")
-                print(f"{'='*50}")
-                print(md_content)
-            else:
-                save_markdown(md_content, output_path)
-
-            results.append({"status": "success", "input": item, "output": output_path})
-
-        except KeyboardInterrupt:
-            print("\nInterrupted by user.")
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error processing {item}: {e}")
-            results.append({"status": "failed", "input": item, "error": str(e)})
 
     # URL mode — process each URL individually (cannot batch different origins)
     if is_url:

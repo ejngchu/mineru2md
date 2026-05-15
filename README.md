@@ -57,12 +57,18 @@ Article URLs (no file extension or `.html`/`.htm`) automatically:
 ### Batch Processing
 
 ```bash
-# Multiple files (each auto-routed individually)
+# Multiple files — ALL files go through Precision API batch upload (token required)
+# Token is auto-retrieved from MINERU_TOKEN env var if not provided
 python mineru2md.py --files file1.pdf file2.pdf image.png --output-dir ./results
 
-# Multiple URLs (each auto-routed: article URLs try Lightweight first)
+# Scan a directory for files to process
+python mineru2md.py --files ./pdfs/*.pdf --output-dir ./results
+
+# Multiple URLs (each processed individually — article URLs try Lightweight first)
 python mineru2md.py --urls url1.pdf url2.pdf --output-dir ./results
 ```
+
+> **Note**: `--files` mode always uses Precision API (batch upload in a single API call). For Lightweight API, use `--file` (single file only).
 
 ### Optional Parameters
 
