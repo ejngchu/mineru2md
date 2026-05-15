@@ -42,6 +42,7 @@ Environment:
 """
 
 import argparse
+import glob as _glob
 import io
 import os
 import re
@@ -54,6 +55,76 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+# Global session with connection pooling
+_session = None
+
+
+def get_session():
+    """Get or create a requests.Session with connection pooling and retry."""
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=20,
+            pool_maxsize=40,
+            max_retries=Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET", "POST", "PUT", "HEAD"]
+            )
+        )
+        _session.mount("https://", adapter)
+        _session.mount("http://", adapter)
+    return _session
+
+
+def parse_error_response(result):
+    """Parse error code and message from API response."""
+    code = str(result.get("code", ""))
+    msg = result.get("msg", "Unknown error")
+
+    if code in ERROR_CODES:
+        error_name, error_hint = ERROR_CODES[code]
+        return f"Error [{code}] {error_name}: {msg}. {error_hint}"
+    elif code.startswith("A02"):
+        return f"Error [{code}] Token error: {msg}. Check your MINERU_TOKEN."
+    elif code.startswith("-6"):
+        return f"Error [{code}] {msg}"
+    return f"Error [{code}] {msg}"
+
+
+def _check_response(response, context="request"):
+    """Check HTTP response and JSON body, raise MinerUError on failure.
+
+    Args:
+        response: requests.Response object
+        context: Human-readable description of the operation (for error messages)
+
+    Returns:
+        dict: Parsed JSON result (guaranteed code=0)
+
+    Raises:
+        MinerUError: On HTTP error or non-zero API code
+    """
+    if response.status_code != 200:
+        msg = f"Error: {context} failed. Status: {response.status_code}"
+        print(msg)
+        if response.text:
+            print(f"Response: {response.text[:1000]}")
+        raise MinerUError(msg)
+
+    result = response.json()
+    if result.get("code") != 0:
+        msg = parse_error_response(result)
+        print(msg)
+        raise MinerUError(msg)
+
+    return result
 
 
 class MinerUError(Exception):
@@ -132,9 +203,9 @@ ERROR_CODES = {
 def get_token():
     """Get API token from environment variable."""
     token = os.environ.get("MINERU_TOKEN")
-    if not token:
-        raise MinerUError("MINERU_TOKEN environment variable is not set.")
-    return token
+    if not token or not token.strip():
+        raise MinerUError("MINERU_TOKEN environment variable is not set or is empty.")
+    return token.strip()
 
 
 def get_headers(token):
@@ -172,19 +243,7 @@ def determine_model_version(filename_or_url, is_url=False):
         return "vlm"
 
 
-def parse_error_response(result):
-    """Parse error code and message from API response."""
-    code = str(result.get("code", ""))
-    msg = result.get("msg", "Unknown error")
 
-    if code in ERROR_CODES:
-        error_name, error_hint = ERROR_CODES[code]
-        return f"Error [{code}] {error_name}: {msg}. {error_hint}"
-    elif code.startswith("A02"):
-        return f"Error [{code}] Token error: {msg}. Check your MINERU_TOKEN."
-    elif code.startswith("-6"):
-        return f"Error [{code}] {msg}"
-    return f"Error [{code}] {msg}"
 
 
 def get_file_size_mb(file_path):
@@ -284,86 +343,148 @@ def get_routing_decision(file_path, force_precision=False):
     return 'precision', reason_str
 
 
+# API limit constants
+API_MAX_FILE_SIZE_MB = 200
+API_MAX_PAGE_COUNT = 200
+API_MAX_BATCH_FILES = 50
+
+
+def validate_file_for_api(file_path):
+    """
+    Validate file against Precision API limits before submission.
+
+    Checks:
+    - File size ≤ 200 MB
+    - Page count ≤ 200 (for PDFs)
+    - File exists
+
+    Returns:
+        list of warning/error messages (empty if valid)
+    """
+    issues = []
+
+    if not os.path.exists(file_path):
+        return [f"File not found: {file_path}"]
+
+    size_mb = get_file_size_mb(file_path)
+    if size_mb > API_MAX_FILE_SIZE_MB:
+        issues.append(f"File size {size_mb:.1f}MB exceeds {API_MAX_FILE_SIZE_MB}MB limit. Please split the file.")
+
+    pages = get_page_count(file_path)
+    if pages is not None and pages > API_MAX_PAGE_COUNT:
+        issues.append(f"Page count {pages} exceeds {API_MAX_PAGE_COUNT} page limit. Please split the file.")
+
+    return issues
+
+
+def validate_batch_count(file_count):
+    """
+    Validate batch file count against API limits.
+
+    Returns:
+        list of warning messages (empty if valid)
+    """
+    issues = []
+    if file_count > API_MAX_BATCH_FILES:
+        issues.append(f"Batch size {file_count} exceeds {API_MAX_BATCH_FILES} file limit. "
+                      f"Only the first {API_MAX_BATCH_FILES} files will be processed.")
+    return issues
+
+
 def make_request_with_retry(method, url, headers=None, json=None, data=None,
                              max_retries=MAX_RETRIES, backoff=INITIAL_BACKOFF):
     """
-    Make HTTP request with retry logic and exponential backoff.
+    Make HTTP request with retry on network/connection errors.
+
+    NOTE: HTTP 5xx/429 retries are handled by the Session Retry adapter automatically.
+    This function only retries on exceptions (timeouts, connection errors, etc.).
     """
     last_exception = None
+    response = None
+    session = get_session()
 
     for attempt in range(max_retries + 1):
         try:
             if method.upper() == "GET":
-                response = requests.get(url, headers=headers, json=json, timeout=60)
+                response = session.get(url, headers=headers, json=json, timeout=60)
             elif method.upper() == "POST":
-                response = requests.post(url, headers=headers, json=json, data=data, timeout=60)
+                response = session.post(url, headers=headers, json=json, data=data, timeout=60)
             elif method.upper() == "PUT":
-                response = requests.put(url, headers=headers, data=data, timeout=120)
+                response = session.put(url, headers=headers, data=data, timeout=120)
             else:
-                response = requests.request(method, url, headers=headers, json=json, data=data, timeout=60)
+                response = session.request(method, url, headers=headers, json=json, data=data, timeout=60)
 
-            # Don't retry on client errors (4xx) except 429 (rate limit) and 5xx
+            # Non-429 4xx are client errors — don't retry
             if 400 <= response.status_code < 500 and response.status_code != 429:
                 return response
 
-            # Retry on 5xx errors or rate limiting
-            if response.status_code >= 500 or response.status_code == 429:
-                if attempt < max_retries:
-                    wait_time = backoff * (2 ** attempt)
-                    print(f"  Request failed with status {response.status_code}. Retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(wait_time)
-                    continue
-
+            # 5xx/429 handled by Session Retry adapter — just return what we got
             return response
 
-        except requests.exceptions.Timeout as e:
-            last_exception = e
-            if attempt < max_retries:
-                wait_time = backoff * (2 ** attempt)
-                print(f"  Request timed out. Retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait_time)
         except requests.exceptions.RequestException as e:
             last_exception = e
             if attempt < max_retries:
                 wait_time = backoff * (2 ** attempt)
-                print(f"  Request failed: {e}. Retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                print(f"  Request failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
 
     print(f"  All {max_retries + 1} attempts failed.")
     if last_exception:
         raise last_exception
-    return response
+    if response is not None:
+        return response
+    raise MinerUError(f"All {max_retries + 1} requests failed with no response (possible network error).")
 
 
 def build_optional_params(args):
     """Build optional parameters dictionary from command line arguments."""
     params = {}
 
-    if hasattr(args, 'enable_formula') and args.enable_formula is not None:
+    if args.enable_formula is not None:
         params["enable_formula"] = args.enable_formula
 
-    if hasattr(args, 'enable_table') and args.enable_table is not None:
+    if args.enable_table is not None:
         params["enable_table"] = args.enable_table
 
-    if hasattr(args, 'is_ocr') and args.is_ocr is not None:
+    if args.is_ocr is not None:
         params["is_ocr"] = args.is_ocr
 
-    if hasattr(args, 'language') and args.language:
+    if args.language:
         params["language"] = args.language
 
-    if hasattr(args, 'page_ranges') and args.page_ranges:
+    if args.page_ranges:
         params["page_ranges"] = args.page_ranges
 
-    if hasattr(args, 'extra_formats') and args.extra_formats:
+    if args.extra_formats:
         params["extra_formats"] = args.extra_formats
 
-    if hasattr(args, 'no_cache') and args.no_cache:
+    if args.no_cache:
         params["no_cache"] = args.no_cache
 
-    if hasattr(args, 'cache_tolerance') and args.cache_tolerance is not None:
+    if args.cache_tolerance is not None:
         params["cache_tolerance"] = args.cache_tolerance
 
     return params
+
+
+def normalize_page_range_for_agent(page_ranges):
+    """
+    Convert Precision API page_ranges format to Agent API page_range format.
+
+    Precision API accepts comma-separated ranges: '1-10,15,20-25'
+    Agent API accepts single range only: '1-10' or single page: '5'
+
+    If comma-separated, take the first range and warn.
+    Returns None if input is empty/None.
+    """
+    if not page_ranges:
+        return None
+    if "," in str(page_ranges):
+        first = str(page_ranges).split(",")[0].strip()
+        print(f"  [Warning] Agent API only supports a single page range (e.g. '1-10'), "
+              f"not comma-separated ranges. Using first range: '{first}'")
+        return first
+    return str(page_ranges)
 
 
 def upload_file_mode(file_path, token, optional_params, output_dir=None):
@@ -374,6 +495,15 @@ def upload_file_mode(file_path, token, optional_params, output_dir=None):
     3. Poll for results via GET /api/v4/extract-results/batch/{batch_id}
     4. Download zip, extract full.md, save it
     """
+    # Validate file against API limits before submission
+    issues = validate_file_for_api(file_path)
+    if issues:
+        for issue in issues:
+            print(f"  [Warning] {issue}")
+        if any("exceeds" in i for i in issues):
+            print("  Aborting due to limit violations.")
+            raise MinerUError("; ".join(issues))
+
     filename = os.path.basename(file_path)
     data_id = str(uuid.uuid4())[:8]
 
@@ -385,8 +515,9 @@ def upload_file_mode(file_path, token, optional_params, output_dir=None):
     print(f"[File Mode] Model version: {model_version}")
 
     # Build request payload with optional parameters
+    files_payload = [{"name": filename, "data_id": data_id}]
     payload = {
-        "files": [{"name": filename, "data_id": data_id}],
+        "files": files_payload,
         "model_version": model_version
     }
     payload.update({k: v for k, v in optional_params.items() if k in [
@@ -395,24 +526,17 @@ def upload_file_mode(file_path, token, optional_params, output_dir=None):
 
     # Add file-level optional params
     if "page_ranges" in optional_params:
-        payload["files"][0]["page_ranges"] = optional_params["page_ranges"]
+        files_payload[0]["page_ranges"] = optional_params["page_ranges"]
     if "is_ocr" in optional_params:
-        payload["files"][0]["is_ocr"] = optional_params["is_ocr"]
+        files_payload[0]["is_ocr"] = optional_params["is_ocr"]
 
     # Step 1: Get upload URL
     headers = get_headers(token)
     print(f"[File Mode] Requesting upload URL...")
-    response = make_request_with_retry("POST", API_V4_FILE_URLS_BATCH, headers=headers, json=payload)
-
-    if response.status_code != 200:
-        print(f"Error: Failed to get upload URL. Status: {response.status_code}")
-        print(f"Response: {response.text}")
-        raise MinerUError(f"Failed to get upload URL. Status: {response.status_code}")
-
-    result = response.json()
-    if result.get("code") != 0:
-        print(parse_error_response(result))
-        raise MinerUError(parse_error_response(result))
+    result = _check_response(
+        make_request_with_retry("POST", API_V4_FILE_URLS_BATCH, headers=headers, json=payload),
+        context="get upload URL"
+    )
 
     batch_id = result["data"]["batch_id"]
     upload_url = result["data"]["file_urls"][0]
@@ -424,9 +548,11 @@ def upload_file_mode(file_path, token, optional_params, output_dir=None):
         upload_response = make_request_with_retry("PUT", upload_url, data=f)
 
     if upload_response.status_code != 200:
-        print(f"Error: Failed to upload file. Status: {upload_response.status_code}")
-        print(f"Response: {upload_response.text}")
-        raise MinerUError(f"Failed to upload file. Status: {upload_response.status_code}")
+        msg = f"Error: Failed to upload file. Status: {upload_response.status_code}"
+        print(msg)
+        if upload_response.text:
+            print(f"Response: {upload_response.text[:500]}")
+        raise MinerUError(msg)
 
     print(f"[File Mode] File uploaded successfully.")
 
@@ -454,17 +580,10 @@ def submit_url_task(url, token, optional_params):
         "enable_formula", "enable_table", "language", "extra_formats", "no_cache", "cache_tolerance"
     ]})
 
-    response = make_request_with_retry("POST", API_V4_EXTRACT_TASK_BATCH, headers=headers, json=payload)
-
-    if response.status_code != 200:
-        print(f"Error: Failed to submit URL. Status: {response.status_code}")
-        print(f"Response: {response.text}")
-        raise MinerUError(f"Failed to submit URL. Status: {response.status_code}")
-
-    result = response.json()
-    if result.get("code") != 0:
-        print(parse_error_response(result))
-        raise MinerUError(parse_error_response(result))
+    result = _check_response(
+        make_request_with_retry("POST", API_V4_EXTRACT_TASK_BATCH, headers=headers, json=payload),
+        context="submit URL task"
+    )
 
     batch_id = result["data"]["batch_id"]
     return batch_id
@@ -488,133 +607,119 @@ def url_mode(url, token, optional_params, output_dir=None):
     return poll_batch_results(batch_id, token, filename, output_dir=output_dir)
 
 
-def poll_task_results(task_id, token, filename, timeout=DEFAULT_TIMEOUT, output_dir=None):
-    """
-    Poll for single task results (used for direct file POST).
-    """
-    headers = get_headers(token)
-    url = API_V4_EXTRACT_TASK_ID.format(task_id=task_id)
-
-    print(f"[Task Mode] Polling task: {task_id}")
-    return poll_with_progress(url, headers, timeout, filename, token, output_dir=output_dir,
-                              extract_key="task_id")
-
-
 def poll_batch_results(batch_id, token, filename, timeout=DEFAULT_TIMEOUT, output_dir=None):
     """
-    Poll for batch results.
+    Poll for batch results via GET /api/v4/extract-results/batch/{batch_id}.
     """
     headers = get_headers(token)
     url = API_V4_EXTRACT_RESULTS_BATCH.format(batch_id=batch_id)
 
     print(f"[Batch Mode] Polling batch: {batch_id}")
-    return poll_with_progress(url, headers, timeout, filename, token, output_dir=output_dir,
-                              extract_key="batch_id")
+    return _poll_batch(url, headers, timeout, filename, token, output_dir=output_dir)
 
 
-def poll_with_progress(url, headers, timeout, filename, token, output_dir=None, extract_key="task_id"):
+def poll_task_results(task_id, token, filename, timeout=DEFAULT_TIMEOUT, output_dir=None):
     """
-    Poll for results with progress bar and timeout handling.
+    Poll for single task results via GET /api/v4/extract/task/{task_id}.
     """
+    headers = get_headers(token)
+    url = API_V4_EXTRACT_TASK_ID.format(task_id=task_id)
+
+    print(f"[Task Mode] Polling task: {task_id}")
+    return _poll_single(url, headers, timeout, filename, token, output_dir=output_dir)
+
+
+def _poll_loop(url, headers, timeout, token, filename, output_dir, extract_state, context="task"):
+    """
+    Core polling loop. Calls extract_state(data, elapsed) on each poll
+    to determine if done, failed, or still waiting.
+
+    Args:
+        extract_state: Callable(data) returning
+            ("done", zip_url | None) | ("failed", err_msg) | ("waiting", display_str) | ("unknown", state_str)
+        filename: Original filename for download_and_extract
+    """
+    session = get_session()
     start_time = time.time()
     last_state = None
     last_progress_update = 0
 
     while True:
-        # Check timeout
         elapsed = time.time() - start_time
         if elapsed >= timeout:
             print(f"\nError: Polling timed out after {timeout} seconds.")
-            print(f"You can check the task status later using the batch/task ID.")
+            print(f"You can check the task status later.")
             raise MinerUError(f"Polling timed out after {timeout} seconds.")
 
-        # Make request
-        response = requests.get(url, headers=headers)
-
-        if response.status_code != 200:
-            print(f"\nError: Failed to query status. Status: {response.status_code}")
-            print(f"Response: {response.text}")
-            raise MinerUError(f"Failed to query status. Status: {response.status_code}")
-
-        result = response.json()
-        if result.get("code") != 0:
-            print(f"\n{parse_error_response(result)}")
-            raise MinerUError(parse_error_response(result))
+        result = _check_response(session.get(url, headers=headers), context=f"poll {context}")
 
         data = result["data"]
+        action, value = extract_state(data)
 
-        # Handle batch results
-        if "extract_result" in data:
-            extract_results = data.get("extract_result", [])
-            if not extract_results:
-                print(f"\r[{format_time(elapsed)}] Waiting for results... ", end="", flush=True)
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            file_result = extract_results[0]
-            state = file_result.get("state")
-            file_name = file_result.get("file_name", filename)
-
-            # Update progress display
-            if state != last_state or elapsed - last_progress_update >= 5:
-                update_progress(state, elapsed, file_result, data)
-                last_state = state
+        if action == "done":
+            if value:
+                return download_and_extract(value, token, filename, output_dir=output_dir)
+            print("\nError: Task done but no result URL returned.")
+            raise MinerUError("Task done but no result URL returned.")
+        elif action == "failed":
+            print(f"\nError: Task failed. Reason: {value}")
+            raise MinerUError(f"Task failed. Reason: {value}")
+        elif action == "waiting":
+            if value != last_state or elapsed - last_progress_update >= 5:
+                print(f"\r[{format_time(elapsed)}] {value}", end="", flush=True)
+                last_state = value
                 last_progress_update = elapsed
-
-            if state == "done":
-                full_zip_url = file_result.get("full_zip_url")
-                if full_zip_url:
-                    return download_and_extract(full_zip_url, token, file_name, output_dir=output_dir)
-                else:
-                    print("\nError: Task done but no full_zip_url returned.")
-                    raise MinerUError("Task done but no full_zip_url returned.")
-            elif state == "failed":
-                print(f"\nError: Task failed. Reason: {file_result.get('err_msg')}")
-                raise MinerUError(f"Task failed. Reason: {file_result.get('err_msg')}")
-            elif state in ("pending", "running", "converting", "waiting-file"):
-                print(f"\r[{format_time(elapsed)}] {state.capitalize()}... ", end="", flush=True)
-                time.sleep(POLL_INTERVAL)
-            else:
-                print(f"\nUnknown state: {state}")
-                time.sleep(POLL_INTERVAL)
+            time.sleep(POLL_INTERVAL)
         else:
-            # Handle single task result
-            state = data.get("state")
-
-            if state == "done":
-                full_zip_url = data.get("full_zip_url")
-                if full_zip_url:
-                    return download_and_extract(full_zip_url, token, filename, output_dir=output_dir)
-                else:
-                    print("\nError: Task done but no full_zip_url returned.")
-                    raise MinerUError("Task done but no full_zip_url returned.")
-            elif state == "failed":
-                print(f"\nError: Task failed. Reason: {data.get('err_msg')}")
-                raise MinerUError(f"Task failed. Reason: {data.get('err_msg')}")
-            elif state in ("pending", "running", "converting"):
-                update_progress(state, elapsed, data, data)
-                time.sleep(POLL_INTERVAL)
-            else:
-                print(f"\nUnknown state: {state}")
-                time.sleep(POLL_INTERVAL)
+            if value:
+                print(f"\nUnknown state: {value}")
+            time.sleep(POLL_INTERVAL)
 
 
-def update_progress(state, elapsed, file_result, data):
-    """Update progress display."""
-    progress_str = f"\r[{format_time(elapsed)}] {state.capitalize()}"
+def _poll_batch(url, headers, timeout, filename, token, output_dir=None):
+    """Poll batch results via GET extract-results endpoint."""
+    def extract_state(data):
+        extract_results = data.get("extract_result", [])
+        if not extract_results:
+            return ("waiting", "Waiting for results...")
 
-    if state == "running" and "extract_progress" in file_result:
-        progress = file_result["extract_progress"]
-        extracted = progress.get('extracted_pages', 0)
-        total = progress.get('total_pages', '?')
-        progress_str += f" - Extracted {extracted}/{total} pages"
-    elif state == "running" and "extract_progress" in data:
-        progress = data["extract_progress"]
-        extracted = progress.get('extracted_pages', 0)
-        total = progress.get('total_pages', '?')
-        progress_str += f" - Extracted {extracted}/{total} pages"
+        file_result = extract_results[0]
+        state = file_result.get("state")
+        file_name = file_result.get("file_name", filename)
 
-    print(progress_str + " " * 10, end="", flush=True)
+        if state == "done":
+            return ("done", file_result.get("full_zip_url"))
+        elif state == "failed":
+            return ("failed", file_result.get("err_msg", "Unknown error"))
+        elif state in ("pending", "running", "converting", "waiting-file"):
+            progress_str = f"{state.capitalize()}"
+            if state == "running" and "extract_progress" in file_result:
+                p = file_result["extract_progress"]
+                progress_str += f" - Extracted {p.get('extracted_pages', 0)}/{p.get('total_pages', '?')} pages"
+            return ("waiting", progress_str)
+        return ("unknown", state)
+
+    return _poll_loop(url, headers, timeout, token, filename, output_dir, extract_state, context="batch")
+
+
+def _poll_single(url, headers, timeout, filename, token, output_dir=None):
+    """Poll single task result via GET extract/task endpoint."""
+    def extract_state(data):
+        state = data.get("state")
+
+        if state == "done":
+            return ("done", data.get("full_zip_url"))
+        elif state == "failed":
+            return ("failed", data.get("err_msg", "Unknown error"))
+        elif state in ("pending", "running", "converting"):
+            progress_str = f"{state.capitalize()}"
+            if state == "running" and "extract_progress" in data:
+                p = data["extract_progress"]
+                progress_str += f" - Extracted {p.get('extracted_pages', 0)}/{p.get('total_pages', '?')} pages"
+            return ("waiting", progress_str)
+        return ("unknown", state)
+
+    return _poll_loop(url, headers, timeout, token, filename, output_dir, extract_state, context="task")
 
 
 def format_time(seconds):
@@ -639,11 +744,13 @@ def download_and_extract(zip_url, token, original_filename, output_dir=None):
         headers["Authorization"] = f"Bearer {token}"
 
     tmp_path = None
+    session = get_session()
+    response_body_prefix = ""
     try:
         # Stream download to temp file (write inside the NamedTemporaryFile context)
         with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
             tmp_path = tmp.name
-            with requests.get(zip_url, headers=headers, timeout=120, stream=True) as response:
+            with session.get(zip_url, headers=headers, timeout=120, stream=True) as response:
                 if response.status_code != 200:
                     print(f"Error: Failed to download zip. Status: {response.status_code}")
                     raise MinerUError(f"Failed to download zip. Status: {response.status_code}")
@@ -651,6 +758,12 @@ def download_and_extract(zip_url, token, original_filename, output_dir=None):
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         tmp.write(chunk)
+                        # Capture first chunk for error diagnostics
+                        if not response_body_prefix:
+                            try:
+                                response_body_prefix = chunk[:500].decode("utf-8", errors="replace")
+                            except Exception:
+                                response_body_prefix = f"<binary chunk of {len(chunk)} bytes>"
 
         print(f"[Download] Downloaded to temp file: {tmp_path}")
 
@@ -726,7 +839,8 @@ def download_and_extract(zip_url, token, original_filename, output_dir=None):
 
     except zipfile.BadZipFile:
         print("Error: Downloaded file is not a valid zip file.")
-        print(f"Content (first 500 chars): {response.content[:500]}")
+        if response_body_prefix:
+            print(f"Content (first 500 chars): {response_body_prefix}")
         raise MinerUError("Downloaded file is not a valid zip file.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -763,7 +877,8 @@ def lightweight_parse_by_file(file_path, **kwargs):
         payload.update(kwargs)
 
     print(f"[Lightweight API] Submitting file: {filename}")
-    response = requests.post(AGENT_PARSE_FILE, json=payload, timeout=60)
+    session = get_session()
+    response = session.post(AGENT_PARSE_FILE, json=payload, timeout=60)
 
     if response.status_code != 200:
         print(f"Error: Lightweight API request failed. Status: {response.status_code}")
@@ -793,7 +908,7 @@ def lightweight_parse_by_file(file_path, **kwargs):
     # Step 2: PUT file to signed URL
     print(f"[Lightweight API] Uploading file to OSS...")
     with open(file_path, "rb") as f:
-        upload_response = requests.put(file_url, data=f, timeout=120)
+        upload_response = session.put(file_url, data=f, timeout=120)
 
     if upload_response.status_code not in (200, 201):
         print(f"Error: File upload failed. Status: {upload_response.status_code}")
@@ -822,7 +937,8 @@ def lightweight_parse_by_url(url, **kwargs):
         payload.update(kwargs)
 
     print(f"[Lightweight API] Submitting URL: {url}")
-    response = requests.post(AGENT_PARSE_URL, json=payload, timeout=60)
+    session = get_session()
+    response = session.post(AGENT_PARSE_URL, json=payload, timeout=60)
 
     if response.status_code != 200:
         print(f"Error: Lightweight API URL request failed. Status: {response.status_code}")
@@ -861,6 +977,7 @@ def lightweight_poll_result(task_id, timeout=AGENT_DEFAULT_TIMEOUT):
     start_time = time.time()
     last_state = None
     last_progress_update = 0
+    session = get_session()
 
     print(f"[Lightweight API] Polling task: {task_id}")
 
@@ -871,7 +988,7 @@ def lightweight_poll_result(task_id, timeout=AGENT_DEFAULT_TIMEOUT):
             raise MinerUError(f"Lightweight API polling timed out after {timeout} seconds.")
 
         try:
-            response = requests.get(url, timeout=60)
+            response = session.get(url, timeout=60)
         except requests.exceptions.RequestException as e:
             print(f"\nError: Request failed: {e}")
             time.sleep(AGENT_POLL_INTERVAL)
@@ -917,7 +1034,7 @@ def lightweight_poll_result(task_id, timeout=AGENT_DEFAULT_TIMEOUT):
             # Get markdown content from markdown_url
             markdown_url = data.get("markdown_url")
             if markdown_url:
-                md_response = requests.get(markdown_url, timeout=60)
+                md_response = session.get(markdown_url, timeout=60)
                 if md_response.status_code == 200:
                     return md_response.text
                 else:
@@ -938,7 +1055,7 @@ def lightweight_poll_result(task_id, timeout=AGENT_DEFAULT_TIMEOUT):
         elif state == "failed":
             print(f"\nError: Task failed. Reason: {data.get('err_msg', 'Unknown error')}")
             raise MinerUError(f"Task failed. Reason: {data.get('err_msg', 'Unknown error')}")
-        elif state in ("pending", "running", "converting", "waiting-file"):
+        elif state in ("pending", "running", "converting", "waiting-file", "uploading"):
             time.sleep(AGENT_POLL_INTERVAL)
         else:
             if state:
@@ -953,7 +1070,9 @@ def lightweight_file_mode(file_path, optional_params, output_dir=None):
     Returns:
         tuple: (markdown_content, original_filename, output_dir)
     """
-    task_id = lightweight_parse_by_file(file_path, **optional_params)
+    # Normalize Precision API params to Agent API format
+    agent_params = _normalize_optional_params_for_agent(optional_params)
+    task_id = lightweight_parse_by_file(file_path, **agent_params)
     md_content = lightweight_poll_result(task_id)
     filename = os.path.basename(file_path)
     return md_content, filename, output_dir
@@ -966,10 +1085,24 @@ def lightweight_url_mode(url, optional_params, output_dir=None):
     Returns:
         tuple: (markdown_content, original_filename, output_dir)
     """
-    task_id = lightweight_parse_by_url(url, **optional_params)
+    # Normalize Precision API params to Agent API format
+    agent_params = _normalize_optional_params_for_agent(optional_params)
+    task_id = lightweight_parse_by_url(url, **agent_params)
     md_content = lightweight_poll_result(task_id)
     filename = url.split("/")[-1].split("?")[0]
     return md_content, filename, output_dir
+
+
+def _normalize_optional_params_for_agent(params):
+    """
+    Normalize optional params from Precision API format to Agent API format.
+
+    - page_ranges (Precision) → page_range (Agent), single range only
+    """
+    agent_params = dict(params)
+    if "page_ranges" in agent_params:
+        agent_params["page_range"] = normalize_page_range_for_agent(agent_params.pop("page_ranges"))
+    return agent_params
 
 
 def parse_with_auto_routing(file_path_or_url, token, optional_params,
@@ -1117,6 +1250,156 @@ def generate_output_filename(input_path, is_url=False, output_dir=None):
     return filename
 
 
+def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
+    """
+    Upload multiple files in a true v4 batch and poll for ALL results.
+
+    Uses a single /api/v4/file-urls/batch call for all files, uploads each,
+    then polls the single batch_id for all results simultaneously.
+
+    Returns:
+        list of dict: [{"status": "success"|"failed", "file": path, "name": name,
+                        "md": content, "output_dir": dir, "error": str}]
+    """
+    if not file_paths:
+        return []
+
+    # Validate all files first
+    all_valid = True
+    for fp in file_paths:
+        issues = validate_file_for_api(fp)
+        if issues:
+            for issue in issues:
+                print(f"  [Warning] {issue}")
+            if any("exceeds" in i for i in issues):
+                all_valid = False
+
+    if not all_valid:
+        raise MinerUError("Some files exceed API limits. Aborting batch.")
+
+    # Build combined payload
+    headers = get_headers(token)
+    model_version = determine_model_version(file_paths[0])  # Use first file's model
+    files_data = []
+    for fp in file_paths:
+        filename = os.path.basename(fp)
+        data_id = str(uuid.uuid4())[:8]
+        file_entry = {"name": filename, "data_id": data_id}
+
+        if "page_ranges" in optional_params:
+            file_entry["page_ranges"] = optional_params["page_ranges"]
+        if "is_ocr" in optional_params:
+            file_entry["is_ocr"] = optional_params["is_ocr"]
+
+        files_data.append(file_entry)
+
+    payload = {"files": files_data, "model_version": model_version}
+    payload.update({k: v for k, v in optional_params.items() if k in [
+        "enable_formula", "enable_table", "language", "extra_formats"
+    ]})
+
+    # Get upload URLs for all files at once
+    print(f"\n[Batch Upload] Requesting upload URLs for {len(file_paths)} file(s)...")
+    result = _check_response(
+        make_request_with_retry("POST", API_V4_FILE_URLS_BATCH, headers=headers, json=payload),
+        context="batch get upload URLs"
+    )
+
+    batch_id = result["data"]["batch_id"]
+    upload_urls = result["data"]["file_urls"]
+
+    if len(upload_urls) != len(file_paths):
+        raise MinerUError(f"Got {len(upload_urls)} upload URLs for {len(file_paths)} files.")
+
+    print(f"[Batch Upload] Batch ID: {batch_id}")
+
+    # Upload each file to its OSS URL
+    for i, fp in enumerate(file_paths):
+        filename = os.path.basename(fp)
+        print(f"[Batch Upload] Uploading [{i+1}/{len(file_paths)}] {filename}...")
+        with open(fp, "rb") as f:
+            upload_response = make_request_with_retry("PUT", upload_urls[i], data=f)
+
+        if upload_response.status_code != 200:
+            print(f"  [Warning] Upload failed for {filename}: HTTP {upload_response.status_code}")
+        else:
+            size_mb = get_file_size_mb(fp)
+            print(f"  OK ({size_mb:.1f}MB)")
+
+    print(f"[Batch Upload] All files uploaded. Polling for results...")
+
+    # Poll the batch results once — get ALL file results
+    url = API_V4_EXTRACT_RESULTS_BATCH.format(batch_id=batch_id)
+    session = get_session()
+    start_time = time.time()
+    timeout = DEFAULT_TIMEOUT
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed >= timeout:
+            print(f"\nError: Batch polling timed out after {timeout} seconds.")
+            raise MinerUError(f"Batch polling timed out after {timeout} seconds.")
+
+        result = _check_response(session.get(url, headers=headers), context="batch poll")
+        data = result["data"]
+        extract_results = data.get("extract_result", [])
+
+        if not extract_results:
+            print(f"\r[{format_time(elapsed)}] Waiting for results...", end="", flush=True)
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        # Check if ALL files are done or failed
+        all_done = all(
+            item.get("state") in ("done", "failed") for item in extract_results
+        )
+        done_count = sum(1 for item in extract_results if item.get("state") == "done")
+        total = len(file_paths)
+
+        print(f"\r[{format_time(elapsed)}] {done_count}/{total} completed...", end="", flush=True)
+
+        if all_done:
+            print()
+            break
+
+        time.sleep(POLL_INTERVAL)
+
+    # Process results for each file
+    batch_results = []
+    for item in extract_results:
+        file_name = item.get("file_name", "unknown")
+        # Find matching original path
+        original_path = next((fp for fp in file_paths if os.path.basename(fp) == file_name), file_name)
+
+        if item.get("state") == "done":
+            zip_url = item.get("full_zip_url")
+            if zip_url:
+                try:
+                    md_content, name, od = download_and_extract(zip_url, token, file_name, output_dir=output_dir)
+                    batch_results.append({
+                        "status": "success", "file": original_path, "name": file_name,
+                        "md": md_content, "output_dir": od
+                    })
+                    continue
+                except Exception as e:
+                    batch_results.append({
+                        "status": "failed", "file": original_path, "name": file_name,
+                        "error": f"Download failed: {e}"
+                    })
+                    continue
+            batch_results.append({
+                "status": "failed", "file": original_path, "name": file_name,
+                "error": "Task done but no full_zip_url"
+            })
+        else:
+            batch_results.append({
+                "status": "failed", "file": original_path, "name": file_name,
+                "error": item.get("err_msg", "Unknown error")
+            })
+
+    return batch_results
+
+
 def process_batch(file_list, token, optional_params, output_dir, is_url=False, force_precision=False,
                   use_title_for_url=False, no_save=False, timestamp=False):
     """
@@ -1126,6 +1409,13 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
     based on file characteristics. Article URLs try Lightweight API first,
     falling back to Precision API. File URLs use Precision API directly.
     """
+    # Validate batch count against API limits
+    count_issues = validate_batch_count(len(file_list))
+    for issue in count_issues:
+        print(f"  [Warning] {issue}")
+    if count_issues:
+        file_list = file_list[:API_MAX_BATCH_FILES]
+
     results = []
     total = len(file_list)
 
@@ -1133,13 +1423,86 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
     print(f"Batch Processing: {total} item(s)")
     print(f"{'='*50}\n")
 
-    for i, item in enumerate(file_list, 1):
-        print(f"\n[{i}/{total}] Processing: {item}")
+    # For file mode, pre-scan routing decisions to batch precision files
+    precision_files = []
+    lightweight_files = []
+    if not is_url:
+        for item in file_list:
+            api_type, _ = get_routing_decision(item, force_precision)
+            if api_type == 'lightweight':
+                lightweight_files.append(item)
+            else:
+                precision_files.append(item)
+
+    # Process precision files in a true batch (single API call)
+    if precision_files:
+        print(f"\n[Batch] Processing {len(precision_files)} precision file(s) in a single batch...")
+        try:
+            if token is None:
+                token = get_token()
+            batch_results = _batch_upload_and_poll(precision_files, token, optional_params, output_dir)
+            for br in batch_results:
+                original_filename = br["name"]
+                output_path = generate_output_filename(original_filename, is_url=False, output_dir=output_dir)
+                if timestamp:
+                    output_path = _apply_timestamp(output_path)
+                if br["status"] == "success":
+                    if no_save:
+                        print(f"\n{'='*50}")
+                        print(f"--- {original_filename} ---")
+                        print(f"{'='*50}")
+                        print(br["md"])
+                    else:
+                        save_markdown(br["md"], output_path)
+                    results.append({"status": "success", "input": br["file"], "output": output_path})
+                else:
+                    print(f"  Error: {br['error']}")
+                    results.append({"status": "failed", "input": br["file"], "error": br["error"]})
+        except Exception as e:
+            for fp in precision_files:
+                results.append({"status": "failed", "input": fp, "error": str(e)})
+        print()
+
+    # Process lightweight files individually
+    for i, item in enumerate(lightweight_files, 1):
+        print(f"[{i}/{len(lightweight_files)}] Processing: {item}")
         print("-" * 40)
 
         try:
-            title = None
-            if is_url:
+            api_type, reason = get_routing_decision(item, force_precision)
+            print(f"[Route] Using Lightweight API ({reason})")
+
+            md_content, original_filename, _ = lightweight_file_mode(item, optional_params, output_dir=output_dir)
+            output_path = generate_output_filename(original_filename, is_url=False, output_dir=output_dir)
+
+            if timestamp:
+                output_path = _apply_timestamp(output_path)
+
+            if no_save:
+                print(f"\n{'='*50}")
+                print(f"--- {original_filename} ---")
+                print(f"{'='*50}")
+                print(md_content)
+            else:
+                save_markdown(md_content, output_path)
+
+            results.append({"status": "success", "input": item, "output": output_path})
+
+        except KeyboardInterrupt:
+            print("\nInterrupted by user.")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error processing {item}: {e}")
+            results.append({"status": "failed", "input": item, "error": str(e)})
+
+    # URL mode — process each URL individually (cannot batch different origins)
+    if is_url:
+        for i, item in enumerate(file_list, 1):
+            print(f"\n[{i}/{total}] Processing: {item}")
+            print("-" * 40)
+
+            try:
+                title = None
                 # Article URLs try Lightweight API first, fallback to Precision
                 if not force_precision and not _url_has_file_extension(item):
                     try:
@@ -1165,37 +1528,26 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
                         original_filename = title
 
                 output_path = generate_output_filename(original_filename, is_url=not title, output_dir=output_dir)
-            else:
-                # Auto-route files based on characteristics
-                api_type, reason = get_routing_decision(item, force_precision)
-                print(f"[Route] Using {'Precision' if api_type == 'precision' else 'Lightweight'} API ({reason})")
 
-                if api_type == 'lightweight':
-                    md_content, original_filename, _ = lightweight_file_mode(item, optional_params, output_dir=output_dir)
+                if timestamp:
+                    output_path = _apply_timestamp(output_path)
+
+                if no_save:
+                    print(f"\n{'='*50}")
+                    print(f"--- {original_filename} ---")
+                    print(f"{'='*50}")
+                    print(md_content)
                 else:
-                    md_content, original_filename, _ = upload_file_mode(item, token, optional_params, output_dir=output_dir)
+                    save_markdown(md_content, output_path)
 
-                output_path = generate_output_filename(original_filename, is_url=False, output_dir=output_dir)
+                results.append({"status": "success", "input": item, "output": output_path})
 
-            if timestamp:
-                output_path = _apply_timestamp(output_path)
-
-            if no_save:
-                print(f"\n{'='*50}")
-                print(f"--- {original_filename} ---")
-                print(f"{'='*50}")
-                print(md_content)
-            else:
-                save_markdown(md_content, output_path)
-
-            results.append({"status": "success", "input": item, "output": output_path})
-
-        except KeyboardInterrupt:
-            print("\nInterrupted by user.")
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error processing {item}: {e}")
-            results.append({"status": "failed", "input": item, "error": str(e)})
+            except KeyboardInterrupt:
+                print("\nInterrupted by user.")
+                sys.exit(1)
+            except Exception as e:
+                print(f"Error processing {item}: {e}")
+                results.append({"status": "failed", "input": item, "error": str(e)})
 
     # Print summary
     print(f"\n{'='*50}")
@@ -1242,7 +1594,6 @@ def main():
 
     # Fix UTF-8 encoding for stdout on Windows
     if sys.platform == "win32":
-        import io
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(
@@ -1355,16 +1706,31 @@ Environment:
             if args.output and not args.output_dir:
                 raise MinerUError("--output is only valid for single file. Use --output-dir for batch processing.")
 
-            # Check if any file needs Precision API
-            needs_precision = args.force_precision or any(
-                not is_lightweight_compatible(f) for f in args.files
-            )
-            if needs_precision:
-                token = get_token()
+            # Expand directories to supported files
+            expanded_files = []
+            supported_globs = ("*.pdf", "*.png", "*.jpg", "*.jpeg", "*.jp2", "*.webp", "*.gif", "*.bmp",
+                              "*.docx", "*.pptx", "*.xlsx", "*.doc", "*.ppt", "*.xls", "*.html", "*.htm")
+            for f in args.files:
+                if os.path.isdir(f):
+                    found = []
+                    for pattern in supported_globs:
+                        found.extend(_glob.glob(os.path.join(f, pattern), recursive=False))
+                        found.extend(_glob.glob(os.path.join(f, pattern.upper()), recursive=False))
+                    if found:
+                        expanded_files.extend(sorted(set(found)))
+                    else:
+                        print(f"  [Warning] No supported files found in directory: {f}")
+                else:
+                    expanded_files.append(f)
+            args.files = expanded_files
 
+            if not args.files:
+                raise MinerUError("No supported files found. Supported types: PDF, images, Word, PowerPoint, Excel, HTML.")
+
+            # Routing + token fetch handled inside process_batch (lazy)
             process_batch(args.files, token, optional_params, args.output_dir,
-                         is_url=False, force_precision=args.force_precision,
-                         use_title_for_url=False, no_save=args.print, timestamp=args.timestamp)
+                          is_url=False, force_precision=args.force_precision,
+                          use_title_for_url=False, no_save=args.print, timestamp=args.timestamp)
 
         elif args.urls:
             # Batch URL mode - article URLs try Lightweight first
