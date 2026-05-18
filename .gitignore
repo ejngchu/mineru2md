@@ -10,7 +10,14 @@ samples/*
 !samples/images/
 samples/images/*
 
-# Generated test output markdown files (not README)
+# Generated output artifacts
+images/
+
+# Sensitive config (contains tokens)
+assets/config.json
+
+# Generated test output markdown files (not README, SKILL.md, or references)
 *.md
 !README.md
 !SKILL.md
+!references/*.md
