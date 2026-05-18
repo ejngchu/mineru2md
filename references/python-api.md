@@ -25,7 +25,7 @@ def get_saved_token():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 config = json.load(f)
-                return config.get("precision_token")
+                return config.get("mineru_token")
         except (json.JSONDecodeError, IOError) as e:
             print(f"Warning: Failed to read config file: {e}")
     return None
@@ -43,7 +43,7 @@ def save_token(token):
                 config = json.load(f)
         except (json.JSONDecodeError, IOError):
             pass
-    config["precision_token"] = token
+    config["mineru_token"] = token
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 ```

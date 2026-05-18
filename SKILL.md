@@ -59,7 +59,7 @@ If a token is needed but neither source provides one:
 **Important**: Load the token from `assets/config.json` using this structure:
 ```json
 {
-  "precision_token": "eyJ0eXBlIjoiSldUIi..."
+  "mineru_token": "eyJ0eXBlIjoiSldUIi..."
 }
 ```
 
