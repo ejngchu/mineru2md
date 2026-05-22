@@ -59,13 +59,13 @@ Article URLs (no file extension or `.html`/`.htm`) automatically:
 ```bash
 # Multiple files — ALL files go through Precision API batch upload (token required)
 # Token is auto-retrieved from MINERU_TOKEN env var if not provided
-python mineru2md.py --files file1.pdf file2.pdf image.png --output-dir ./results
+python mineru2md.py --files file1.pdf file2.pdf image.png --output ./results/
 
 # Scan a directory for files to process
-python mineru2md.py --files ./pdfs/*.pdf --output-dir ./results
+python mineru2md.py --files ./pdfs/*.pdf --output ./results/
 
 # Multiple URLs (each processed individually — article URLs try Lightweight first)
-python mineru2md.py --urls url1.pdf url2.pdf --output-dir ./results
+python mineru2md.py --urls url1.pdf url2.pdf --output ./results/
 ```
 
 > **Note**: `--files` mode always uses Precision API (batch upload in a single API call). For Lightweight API, use `--file` (single file only).
@@ -135,13 +135,13 @@ export MINERU_TOKEN='your_token'
 
 | Mode | Output File Name | Notes |
 |------|-----------------|-------|
-| `--file ./report.pdf` | `report.md` (same directory) | Use `--output result.md` to specify path |
-| `--file ./doc.pdf --output ./out/doc.md` | `./out/doc.md` | Directory auto-created |
+| `--file ./report.pdf` | `report.md` (same directory) | Use `--output ./dir/` to specify directory |
+| `--file ./doc.pdf --output ./out/` | `./out/doc.md` | Directory auto-created |
 | `--url https://example.com/file.pdf` | `file.md` | Direct file URL → filename from URL path |
 | `--url https://example.com/article` | `文章标题.md` | Article URL → filename from document title |
 | `--url https://example.com/page.html` | `页面标题.md` | `.html`/`.htm` → filename from document title |
-| `--files ... --output-dir ./results` | `./results/name1.md`, `./results/name2.md` | One `.md` per input file |
-| `--urls ... --output-dir ./results` | Same as above | Article URLs use title; file URLs use URL path |
+| `--files ... --output ./results/` | `./results/name1.md`, `./results/name2.md` | One `.md` per input file |
+| `--urls ... --output ./results/` | Same as above | Article URLs use title; file URLs use URL path |
 
 **`--timestamp`**: Prepends `YYYY-MM-DD ` to output filename (e.g., `2026-05-14 report.md`). Not applied when `--output` is specified.
 

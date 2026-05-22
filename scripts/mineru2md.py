@@ -4,41 +4,6 @@ MinerU Converter - Convert files or URLs to markdown using MinerU APIs.
 
 Auto-routes between Lightweight Agent API (no token needed) and Precision API (token needed)
 based on file characteristics.
-
-Lightweight API (auto-selected when file qualifies):
-  - File size ≤ 10 MB, page count ≤ 20, supported type (PDF, image, Docx, PPTx, Xlsx)
-  - No token required
-
-Precision API (fallback):
-  - Files >10 MB, >20 pages, or unsupported types
-  - Token required (MINERU_TOKEN)
-
-Usage:
-    python mineru2md.py --file <path>           # File upload mode (auto-routed)
-    python mineru2md.py --url <url>             # URL mode (auto-routed for articles)
-    python mineru2md.py --file <path> --output <output.md>
-
-    # Batch mode (multiple files/URLs)
-    python mineru2md.py --files file1.pdf file2.pdf --output-dir ./results
-    python mineru2md.py --urls url1.pdf url2.pdf --output-dir ./results
-
-    # With optional parameters
-    python mineru2md.py --file ./doc.pdf --enable-formula --enable-table --language en
-    python mineru2md.py --url https://example.com/doc.pdf --page-ranges 1-10,20
-
-    # Force Precision API for compatible files
-    python mineru2md.py --file ./doc.pdf --force-precision
-
-    # Print to stdout instead of saving
-    python mineru2md.py --file ./doc.pdf --print
-    python mineru2md.py --url https://example.com/article --print
-
-    # Add timestamp to output filename
-    python mineru2md.py --url https://example.com/article --timestamp
-
-Environment:
-    MINERU_TOKEN - API token for authentication (Bearer token). Only needed for Precision API.
-                   Article URLs try Lightweight API first (no token), fallback to Precision.
 """
 
 import argparse
@@ -53,17 +18,120 @@ import uuid
 import zipfile
 from datetime import datetime
 from urllib.parse import urlparse
+from typing import Optional
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# Global session with connection pooling
+# =============================================================================
+# Configuration - API endpoints, limits, and timeouts
+# =============================================================================
+
+class APIConfig:
+    """Centralized API configuration for MinerU services."""
+
+    # Base URLs
+    BASE_URL = "https://mineru.net"
+    API_V4_BASE = f"{BASE_URL}/api/v4"
+    AGENT_API_BASE = f"{BASE_URL}/api/v1/agent"
+
+    # Precision API endpoints
+    API_V4_FILE_URLS_BATCH = f"{API_V4_BASE}/file-urls/batch"
+    API_V4_EXTRACT_TASK = f"{API_V4_BASE}/extract/task"
+    API_V4_EXTRACT_TASK_ID = f"{API_V4_BASE}/extract/task/{{task_id}}"
+    API_V4_EXTRACT_TASK_BATCH = f"{API_V4_BASE}/extract/task/batch"
+    API_V4_EXTRACT_RESULTS_BATCH = f"{API_V4_BASE}/extract-results/batch/{{batch_id}}"
+
+    # Lightweight Agent API endpoints
+    AGENT_PARSE_URL = f"{AGENT_API_BASE}/parse/url"
+    AGENT_PARSE_FILE = f"{AGENT_API_BASE}/parse/file"
+    AGENT_QUERY_RESULT = f"{AGENT_API_BASE}/parse/{{task_id}}"
+
+    # API Limits
+    MAX_FILE_SIZE_MB = 200
+    MAX_PRECISION_PAGES = 200
+    LIGHTWEIGHT_MAX_PAGES = 20  # Lightweight API page limit
+    LIGHTWEIGHT_MAX_SIZE_MB = 10
+    MAX_BATCH_FILES = 50
+
+    # Timeouts & Intervals (seconds)
+    DEFAULT_TIMEOUT = 300
+    POLL_INTERVAL = 3
+    AGENT_POLL_INTERVAL = 2
+    AGENT_DEFAULT_TIMEOUT = 180
+    INITIAL_BACKOFF = 1
+    MAX_RETRIES = 3
+
+    # Lightweight API supported file extensions
+    LIGHTWEIGHT_SUPPORTED_EXTENSIONS = {
+        "pdf", "png", "jpg", "jpeg", "jp2", "webp", "gif", "bmp", "docx", "pptx", "xlsx"
+    }
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+class MinerUError(Exception):
+    """Base exception for MinerU errors."""
+    pass
+
+
+# =============================================================================
+# Error Codes
+# =============================================================================
+
+# Precision API error codes
+ERROR_CODES = {
+    "A0202": ("Token error", "Check that your MINERU_TOKEN is correct."),
+    "A0211": ("Token expired", "Get a new token from MinerU dashboard."),
+    "-500": ("Parameter error", "Ensure parameter types and Content-Type are correct."),
+    "-10001": ("Service error", "Service temporarily unavailable. Try again later."),
+    "-10002": ("Request parameter error", "Check your request parameters format."),
+    "-60001": ("Upload URL generation failed", "Please try again later."),
+    "-60002": ("File format matching failed", "Ensure filename has correct extension."),
+    "-60003": ("File read failed", "The file may be corrupted."),
+    "-60004": ("Empty file", "Please upload a valid non-empty file."),
+    "-60005": ("File size exceeds limit", "Maximum file size is 200MB."),
+    "-60006": ("Page count exceeds limit", "Maximum page count is 200."),
+    "-60007": ("Model service unavailable", "Please try again later."),
+    "-60008": ("File read timeout", "Check that the URL is accessible."),
+    "-60009": ("Task queue full", "Please try again later."),
+    "-60010": ("Parsing failed", "Please try again."),
+    "-60011": ("Invalid file", "Ensure the file was uploaded successfully."),
+    "-60012": ("Task not found", "Verify the task_id is valid."),
+    "-60013": ("Access denied", "You can only access your own tasks."),
+    "-60014": ("Cannot delete running task", "Running tasks cannot be deleted."),
+    "-60015": ("File conversion failed", "Try converting to PDF manually."),
+    "-60016": ("File conversion failed", "Try a different format or retry."),
+    "-60017": ("Retry limit reached", "Wait and retry."),
+    "-60018": ("Daily limit reached", "Try again tomorrow."),
+    "-60019": ("HTML parsing quota exceeded", "Try again tomorrow."),
+    "-60020": ("File splitting failed", "Please try again later."),
+    "-60021": ("Page count reading failed", "Please try again later."),
+    "-60022": ("Webpage read failed", "Check network or rate limiting."),
+    "-60023": ("Invalid URL", "The URL is invalid or inaccessible."),
+}
+
+# Lightweight Agent API error codes
+AGENT_ERROR_CODES = {
+    "-30001": ("File too large", f"File exceeds {APIConfig.LIGHTWEIGHT_MAX_SIZE_MB}MB limit."),
+    "-30002": ("Unsupported file type", "Use PDF/image/Docx/PPTx/Xlsx."),
+    "-30003": ("Page count exceeds limit", f"File exceeds {APIConfig.LIGHTWEIGHT_MAX_PAGES} page limit."),
+    "-30004": ("Request parameter error", "Check required parameters."),
+}
+
+
+# =============================================================================
+# HTTP Session Management
+# =============================================================================
+
 _session = None
 
 
-def get_session():
+def get_session() -> requests.Session:
     """Get or create a requests.Session with connection pooling and retry."""
     global _session
     if _session is None:
@@ -83,34 +151,49 @@ def get_session():
     return _session
 
 
-def parse_error_response(result):
-    """Parse error code and message from API response."""
-    code = str(result.get("code", ""))
-    msg = result.get("msg", "Unknown error")
+def make_request_with_retry(
+    method: str, url: str, headers: Optional[dict] = None,
+    json: Optional[dict] = None, data: Optional[bytes] = None,
+    max_retries: int = APIConfig.MAX_RETRIES,
+    backoff: float = APIConfig.INITIAL_BACKOFF
+) -> requests.Response:
+    """Make HTTP request with retry on network/connection errors."""
+    last_exception = None
+    response = None
+    session = get_session()
 
-    if code in ERROR_CODES:
-        error_name, error_hint = ERROR_CODES[code]
-        return f"Error [{code}] {error_name}: {msg}. {error_hint}"
-    elif code.startswith("A02"):
-        return f"Error [{code}] Token error: {msg}. Check your MINERU_TOKEN."
-    elif code.startswith("-6"):
-        return f"Error [{code}] {msg}"
-    return f"Error [{code}] {msg}"
+    for attempt in range(max_retries + 1):
+        try:
+            if method.upper() == "GET":
+                response = session.get(url, headers=headers, json=json, timeout=60)
+            elif method.upper() == "POST":
+                response = session.post(url, headers=headers, json=json, data=data, timeout=60)
+            elif method.upper() == "PUT":
+                response = session.put(url, headers=headers, data=data, timeout=120)
+            else:
+                response = session.request(method, url, headers=headers, json=json, data=data, timeout=60)
+
+            if 400 <= response.status_code < 500 and response.status_code != 429:
+                return response
+            return response
+
+        except requests.exceptions.RequestException as e:
+            last_exception = e
+            if attempt < max_retries:
+                wait_time = backoff * (2 ** attempt)
+                print(f"  Request failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+
+    print(f"  All {max_retries + 1} attempts failed.")
+    if last_exception:
+        raise last_exception
+    if response is not None:
+        return response
+    raise MinerUError(f"All {max_retries + 1} requests failed with no response.")
 
 
-def _check_response(response, context="request"):
-    """Check HTTP response and JSON body, raise MinerUError on failure.
-
-    Args:
-        response: requests.Response object
-        context: Human-readable description of the operation (for error messages)
-
-    Returns:
-        dict: Parsed JSON result (guaranteed code=0)
-
-    Raises:
-        MinerUError: On HTTP error or non-zero API code
-    """
+def _check_response(response: requests.Response, context: str = "request") -> dict:
+    """Check HTTP response and JSON body, raise MinerUError on failure."""
     if response.status_code != 200:
         msg = f"Error: {context} failed. Status: {response.status_code}"
         print(msg)
@@ -127,139 +210,47 @@ def _check_response(response, context="request"):
     return result
 
 
-class MinerUError(Exception):
-    """Base exception for MinerU errors."""
-    pass
+def parse_error_response(result: dict) -> str:
+    """Parse error code and message from API response."""
+    code = str(result.get("code", ""))
+    msg = result.get("msg", "Unknown error")
+
+    if code in ERROR_CODES:
+        error_name, error_hint = ERROR_CODES[code]
+        return f"Error [{code}] {error_name}: {msg}. {error_hint}"
+    elif code.startswith("A02"):
+        return f"Error [{code}] Token error: {msg}. Check your MINERU_TOKEN."
+    elif code.startswith("-6"):
+        return f"Error [{code}] {msg}"
+    return f"Error [{code}] {msg}"
 
 
-# API Configuration
-BASE_URL = "https://mineru.net"
-API_V4_FILE_URLS_BATCH = f"{BASE_URL}/api/v4/file-urls/batch"
-API_V4_EXTRACT_TASK_BATCH = f"{BASE_URL}/api/v4/extract/task/batch"
-API_V4_EXTRACT_TASK = f"{BASE_URL}/api/v4/extract/task"
-API_V4_EXTRACT_TASK_ID = f"{BASE_URL}/api/v4/extract/task/{{task_id}}"
-API_V4_EXTRACT_RESULTS_BATCH = f"{BASE_URL}/api/v4/extract-results/batch/{{batch_id}}"
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
-# Polling configuration
-POLL_INTERVAL = 3  # seconds
-DEFAULT_TIMEOUT = 300  # seconds
-MAX_RETRIES = 3
-INITIAL_BACKOFF = 1  # seconds
+def format_time(seconds: float) -> str:
+    """Format seconds to mm:ss."""
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{minutes:02d}:{secs:02d}"
 
 
-# Lightweight Agent API Configuration (no token needed)
-AGENT_API_BASE = "https://mineru.net/api/v1/agent"
-AGENT_PARSE_URL = f"{AGENT_API_BASE}/parse/url"
-AGENT_PARSE_FILE = f"{AGENT_API_BASE}/parse/file"
-AGENT_QUERY_RESULT = f"{AGENT_API_BASE}/parse/{{task_id}}"
-
-# Lightweight API polling
-AGENT_POLL_INTERVAL = 2  # seconds
-AGENT_DEFAULT_TIMEOUT = 180  # seconds
-
-# Lightweight API error codes
-AGENT_ERROR_CODES = {
-    "-30001": ("File too large for lightweight API", "File exceeds 10MB limit. Use precision API."),
-    "-30002": ("Unsupported file type for lightweight API", "Use PDF/image/Docx/PPTx/Xlsx for lightweight API."),
-    "-30003": ("Page count exceeds lightweight API limit", "File exceeds 20 page limit. Use precision API or specify page_range."),
-    "-30004": ("Request parameter error", "Check required parameters."),
-}
-
-# Lightweight API supported file extensions
-LIGHTWEIGHT_SUPPORTED_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "jp2", "webp", "gif", "bmp", "docx", "pptx", "xlsx"}
-
-# Error code mappings for user-friendly messages
-ERROR_CODES = {
-    "A0202": ("Token error", "Check that your MINERU_TOKEN is correct. Ensure it has 'Bearer ' prefix."),
-    "A0211": ("Token expired", "Your token has expired. Please obtain a new token from the MinerU dashboard."),
-    "-500": ("Parameter error", "Ensure parameter types and Content-Type are correct."),
-    "-10001": ("Service error", "The service is temporarily unavailable. Please try again later."),
-    "-10002": ("Request parameter error", "Check your request parameters format."),
-    "-60001": ("Upload URL generation failed", "Please try again later."),
-    "-60002": ("File format matching failed", "Ensure filename has correct extension (pdf, doc, docx, ppt, pptx, xls, xlsx, png, jp(e)g)."),
-    "-60003": ("File read failed", "The file may be corrupted. Please check and re-upload."),
-    "-60004": ("Empty file", "Please upload a valid non-empty file."),
-    "-60005": ("File size exceeds limit", "Maximum file size is 200MB."),
-    "-60006": ("Page count exceeds limit", "Maximum page count is 200. Please split the file."),
-    "-60007": ("Model service temporarily unavailable", "Please try again later or contact support."),
-    "-60008": ("File read timeout", "Check that the URL is accessible and try again."),
-    "-60009": ("Task queue full", "Please try again later."),
-    "-60010": ("Parsing failed", "Please try again."),
-    "-60011": ("Invalid file", "Ensure the file has been uploaded successfully."),
-    "-60012": ("Task not found", "Verify the task_id is valid and has not been deleted."),
-    "-60013": ("Access denied", "You can only access your own tasks."),
-    "-60014": ("Cannot delete running task", "Running tasks cannot be deleted."),
-    "-60015": ("File conversion failed", "Try converting to PDF manually and re-upload."),
-    "-60016": ("File conversion failed", "Try a different export format or retry."),
-    "-60017": ("Retry limit reached", "Wait for model upgrade and retry."),
-    "-60018": ("Daily limit reached", "Daily parsing limit reached. Try again tomorrow."),
-    "-60019": ("HTML parsing quota exceeded", "HTML parsing quota exceeded. Try again tomorrow."),
-    "-60020": ("File splitting failed", "Please try again later."),
-    "-60021": ("Page count reading failed", "Please try again later."),
-    "-60022": ("Webpage read failed", "Failed to read the webpage. May be due to network issues or rate limiting."),
-}
-
-
-def get_token():
-    """Get API token from environment variable."""
-    token = os.environ.get("MINERU_TOKEN")
-    if not token or not token.strip():
-        raise MinerUError("MINERU_TOKEN environment variable is not set or is empty.")
-    return token.strip()
-
-
-def get_headers(token):
-    """Get headers with authorization."""
-    return {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
-
-def extract_file_extension(filename):
+def extract_file_extension(filename: str) -> str:
     """Extract file extension from filename."""
     if "." in filename:
         return filename.rsplit(".", 1)[1].lower()
     return ""
 
 
-def determine_model_version(filename_or_url, is_url=False):
-    """
-    Determine model version based on file extension or URL.
-
-    For HTML files or URLs pointing to web pages (no downloadable file extension
-    or .html/.htm extension), use MinerU-HTML. For PDFs, documents, images, use vlm.
-    """
-    if is_url:
-        if _url_has_file_extension(filename_or_url):
-            return "vlm"
-        # URL has no downloadable extension, or is .html/.htm → MinerU-HTML
-        return "MinerU-HTML"
-    else:
-        ext = extract_file_extension(filename_or_url)
-        html_extensions = {"html", "htm"}
-        if ext in html_extensions:
-            return "MinerU-HTML"
-        return "vlm"
-
-
-
-
-
-def get_file_size_mb(file_path):
-    """Get file size in MB."""
+def get_file_size_mb(file_path: str) -> float:
+    """Get file size in megabytes."""
     size_bytes = os.path.getsize(file_path)
     return size_bytes / (1024 * 1024)
 
 
-def get_page_count(file_path):
-    """
-    Get page count for PDF files using PyMuPDF (fitz).
-
-    Returns:
-        int: Page count (0 for non-PDF files)
-        None: If PyMuPDF is not available or page count cannot be determined
-    """
+def get_page_count(file_path: str) -> Optional[int]:
+    """Get page count for PDF files using PyMuPDF (fitz). Returns 0 for non-PDFs."""
     ext = extract_file_extension(file_path)
     if ext != "pdf":
         return 0
@@ -278,49 +269,117 @@ def get_page_count(file_path):
         return None
 
 
-def is_supported_lightweight_type(file_path):
-    """Check if file extension is supported by the Lightweight Agent API."""
+def extract_title(md_content: str) -> Optional[str]:
+    """Extract the first level-1 heading from markdown to use as filename."""
+    match = re.search(r'^#\s+(.+)$', md_content, re.MULTILINE)
+    if match:
+        title = match.group(1).strip()
+        title = re.sub(r'[\\/:*?"<>|]', '_', title)
+        title = title.strip().strip('.')
+        if len(title) > 100:
+            title = title[:100].rstrip()
+        if not title:
+            return None
+        return title
+    return None
+
+
+def _url_has_file_extension(url: str) -> bool:
+    """Check if URL path ends with a recognizable file extension for download."""
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    last_seg = path.split("/")[-1] if "/" in path else ""
+    ext_match = re.search(r'\.([a-zA-Z]{2,5})$', last_seg)
+    if not ext_match:
+        return False
+    ext = ext_match.group(1).lower()
+    download_extensions = {"pdf", "png", "jpg", "jpeg", "jp2", "webp", "gif", "bmp",
+                          "docx", "pptx", "xlsx", "doc", "ppt", "xls"}
+    return ext in download_extensions
+
+
+def determine_model_version(filename_or_url: str, is_url: bool = False) -> str:
+    """Determine model version based on file extension or URL."""
+    if is_url:
+        if _url_has_file_extension(filename_or_url):
+            return "vlm"
+        return "MinerU-HTML"
+    else:
+        ext = extract_file_extension(filename_or_url)
+        if ext in {"html", "htm"}:
+            return "MinerU-HTML"
+        return "vlm"
+
+
+def _apply_timestamp(output_path: str) -> str:
+    """Prepend current date (YYYY-MM-DD) to the output filename."""
+    date_prefix = datetime.now().strftime("%Y-%m-%d ")
+    parent = os.path.dirname(output_path)
+    basename = os.path.basename(output_path)
+    new_name = date_prefix + basename
+    if parent:
+        return os.path.join(parent, new_name)
+    return new_name
+
+
+def save_markdown(content: str, output_path: str) -> None:
+    """Save markdown content to file."""
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"[Save] Markdown saved to: {output_path}")
+
+
+def generate_output_filename(input_path: str, is_url: bool = False) -> str:
+    """Generate output filename from input path or URL."""
+    if is_url:
+        url_part = input_path.split("/")[-1].split("?")[0]
+        if "." in url_part:
+            filename = url_part.rsplit(".", 1)[0] + ".md"
+        else:
+            filename = url_part + ".md"
+    else:
+        basename = os.path.basename(input_path)
+        if "." in basename:
+            name_part, _, ext = basename.rpartition(".")
+            if re.match(r'^[a-zA-Z]{2,5}$', ext):
+                filename = name_part + ".md"
+            else:
+                filename = basename + ".md"
+        else:
+            filename = basename + ".md"
+
+    return filename
+
+
+# =============================================================================
+# Routing Logic
+# =============================================================================
+
+def is_lightweight_compatible(file_path: str) -> bool:
+    """Check if file qualifies for the Lightweight Agent API."""
     ext = extract_file_extension(file_path)
-    return ext in LIGHTWEIGHT_SUPPORTED_EXTENSIONS
-
-
-def is_lightweight_compatible(file_path):
-    """
-    Check if file qualifies for the Lightweight Agent API.
-
-    Conditions (all must be met):
-    - File extension must be in LIGHTWEIGHT_SUPPORTED_EXTENSIONS
-    - File size must be ≤ 10 MB
-    - Page count must be ≤ 20 (for PDFs; non-PDFs have page count 0)
-    - PyMuPDF must be available for PDFs (otherwise cannot verify page count)
-
-    Returns:
-        bool: True if file is compatible with lightweight API
-    """
-    if not is_supported_lightweight_type(file_path):
+    if ext not in APIConfig.LIGHTWEIGHT_SUPPORTED_EXTENSIONS:
         return False
 
     size_mb = get_file_size_mb(file_path)
-    if size_mb > 10:
+    if size_mb > APIConfig.LIGHTWEIGHT_MAX_SIZE_MB:
         return False
 
     pages = get_page_count(file_path)
     if pages is None:
-        # Cannot determine page count for PDF - fall back to precision API
         return False
-    if pages > 20:
+    if pages > APIConfig.LIGHTWEIGHT_MAX_PAGES:
         return False
 
     return True
 
 
-def get_routing_decision(file_path, force_precision=False):
-    """
-    Determine which API to use and return (api_type, reason).
-
-    Returns:
-        tuple: (api_type: 'lightweight'|'precision', reason: str)
-    """
+def get_routing_decision(file_path: str, force_precision: bool = False) -> tuple[str, str]:
+    """Determine which API to use and return (api_type, reason)."""
     if force_precision:
         return 'precision', "forced via --force-precision"
 
@@ -328,14 +387,17 @@ def get_routing_decision(file_path, force_precision=False):
         return 'lightweight', "no token needed"
 
     reasons = []
-    if not is_supported_lightweight_type(file_path):
+    ext = extract_file_extension(file_path)
+    if ext not in APIConfig.LIGHTWEIGHT_SUPPORTED_EXTENSIONS:
         reasons.append("unsupported file type")
+
     size_mb = get_file_size_mb(file_path)
-    if size_mb > 10:
-        reasons.append(f"file size {size_mb:.1f}MB > 10MB")
+    if size_mb > APIConfig.LIGHTWEIGHT_MAX_SIZE_MB:
+        reasons.append(f"file size {size_mb:.1f}MB > {APIConfig.LIGHTWEIGHT_MAX_SIZE_MB}MB")
+
     pages = get_page_count(file_path)
-    if pages is not None and pages > 20:
-        reasons.append(f"page count {pages} > 20")
+    if pages is not None and pages > APIConfig.LIGHTWEIGHT_MAX_PAGES:
+        reasons.append(f"page count {pages} > {APIConfig.LIGHTWEIGHT_MAX_PAGES}")
     elif pages is None:
         reasons.append("cannot determine page count")
 
@@ -343,542 +405,50 @@ def get_routing_decision(file_path, force_precision=False):
     return 'precision', reason_str
 
 
-# API limit constants
-API_MAX_FILE_SIZE_MB = 200
-API_MAX_PAGE_COUNT = 200
-API_MAX_BATCH_FILES = 50
-
-
-def validate_file_for_api(file_path):
-    """
-    Validate file against Precision API limits before submission.
-
-    Checks:
-    - File size ≤ 200 MB
-    - Page count ≤ 200 (for PDFs)
-    - File exists
-
-    Returns:
-        list of warning/error messages (empty if valid)
-    """
+def validate_file_for_api(file_path: str) -> list:
+    """Validate file against Precision API limits before submission."""
     issues = []
 
     if not os.path.exists(file_path):
         return [f"File not found: {file_path}"]
 
     size_mb = get_file_size_mb(file_path)
-    if size_mb > API_MAX_FILE_SIZE_MB:
-        issues.append(f"File size {size_mb:.1f}MB exceeds {API_MAX_FILE_SIZE_MB}MB limit. Please split the file.")
+    if size_mb > APIConfig.MAX_FILE_SIZE_MB:
+        issues.append(f"File size {size_mb:.1f}MB exceeds {APIConfig.MAX_FILE_SIZE_MB}MB limit.")
 
     pages = get_page_count(file_path)
-    if pages is not None and pages > API_MAX_PAGE_COUNT:
-        issues.append(f"Page count {pages} exceeds {API_MAX_PAGE_COUNT} page limit. Please split the file.")
+    if pages is not None and pages > APIConfig.MAX_PRECISION_PAGES:
+        issues.append(f"Page count {pages} exceeds {APIConfig.MAX_PRECISION_PAGES} page limit.")
 
     return issues
 
 
-def validate_batch_count(file_count):
-    """
-    Validate batch file count against API limits.
-
-    Returns:
-        list of warning messages (empty if valid)
-    """
+def validate_batch_count(file_count: int) -> list:
+    """Validate batch file count against API limits."""
     issues = []
-    if file_count > API_MAX_BATCH_FILES:
-        issues.append(f"Batch size {file_count} exceeds {API_MAX_BATCH_FILES} file limit. "
-                      f"Only the first {API_MAX_BATCH_FILES} files will be processed.")
+    if file_count > APIConfig.MAX_BATCH_FILES:
+        issues.append(f"Batch size {file_count} exceeds {APIConfig.MAX_BATCH_FILES} file limit.")
     return issues
 
 
-def make_request_with_retry(method, url, headers=None, json=None, data=None,
-                             max_retries=MAX_RETRIES, backoff=INITIAL_BACKOFF):
-    """
-    Make HTTP request with retry on network/connection errors.
-
-    NOTE: HTTP 5xx/429 retries are handled by the Session Retry adapter automatically.
-    This function only retries on exceptions (timeouts, connection errors, etc.).
-    """
-    last_exception = None
-    response = None
-    session = get_session()
-
-    for attempt in range(max_retries + 1):
-        try:
-            if method.upper() == "GET":
-                response = session.get(url, headers=headers, json=json, timeout=60)
-            elif method.upper() == "POST":
-                response = session.post(url, headers=headers, json=json, data=data, timeout=60)
-            elif method.upper() == "PUT":
-                response = session.put(url, headers=headers, data=data, timeout=120)
-            else:
-                response = session.request(method, url, headers=headers, json=json, data=data, timeout=60)
-
-            # Non-429 4xx are client errors — don't retry
-            if 400 <= response.status_code < 500 and response.status_code != 429:
-                return response
-
-            # 5xx/429 handled by Session Retry adapter — just return what we got
-            return response
-
-        except requests.exceptions.RequestException as e:
-            last_exception = e
-            if attempt < max_retries:
-                wait_time = backoff * (2 ** attempt)
-                print(f"  Request failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-
-    print(f"  All {max_retries + 1} attempts failed.")
-    if last_exception:
-        raise last_exception
-    if response is not None:
-        return response
-    raise MinerUError(f"All {max_retries + 1} requests failed with no response (possible network error).")
-
-
-def build_optional_params(args):
-    """Build optional parameters dictionary from command line arguments."""
-    params = {}
-
-    if args.enable_formula is not None:
-        params["enable_formula"] = args.enable_formula
-
-    if args.enable_table is not None:
-        params["enable_table"] = args.enable_table
-
-    if args.is_ocr is not None:
-        params["is_ocr"] = args.is_ocr
-
-    if args.language:
-        params["language"] = args.language
-
-    if args.page_ranges:
-        params["page_ranges"] = args.page_ranges
-
-    if args.extra_formats:
-        params["extra_formats"] = args.extra_formats
-
-    if args.no_cache:
-        params["no_cache"] = args.no_cache
-
-    if args.cache_tolerance is not None:
-        params["cache_tolerance"] = args.cache_tolerance
-
-    return params
-
-
-def normalize_page_range_for_agent(page_ranges):
-    """
-    Convert Precision API page_ranges format to Agent API page_range format.
-
-    Precision API accepts comma-separated ranges: '1-10,15,20-25'
-    Agent API accepts single range only: '1-10' or single page: '5'
-
-    If comma-separated, take the first range and warn.
-    Returns None if input is empty/None.
-    """
-    if not page_ranges:
-        return None
-    if "," in str(page_ranges):
-        first = str(page_ranges).split(",")[0].strip()
-        print(f"  [Warning] Agent API only supports a single page range (e.g. '1-10'), "
-              f"not comma-separated ranges. Using first range: '{first}'")
-        return first
-    return str(page_ranges)
-
-
-def upload_file_mode(file_path, token, optional_params, output_dir=None):
-    """
-    Handle file upload mode.
-    1. Get upload URLs via POST /api/v4/file-urls/batch
-    2. Upload file via PUT to the upload URL
-    3. Poll for results via GET /api/v4/extract-results/batch/{batch_id}
-    4. Download zip, extract full.md, save it
-    """
-    # Validate file against API limits before submission
-    issues = validate_file_for_api(file_path)
-    if issues:
-        for issue in issues:
-            print(f"  [Warning] {issue}")
-        if any("exceeds" in i for i in issues):
-            print("  Aborting due to limit violations.")
-            raise MinerUError("; ".join(issues))
-
-    filename = os.path.basename(file_path)
-    data_id = str(uuid.uuid4())[:8]
-
-    print(f"[File Mode] Processing: {filename}")
-    print(f"[File Mode] Data ID: {data_id}")
-
-    # Determine model version
-    model_version = determine_model_version(filename)
-    print(f"[File Mode] Model version: {model_version}")
-
-    # Build request payload with optional parameters
-    files_payload = [{"name": filename, "data_id": data_id}]
-    payload = {
-        "files": files_payload,
-        "model_version": model_version
-    }
-    payload.update({k: v for k, v in optional_params.items() if k in [
-        "enable_formula", "enable_table", "language", "extra_formats"
-    ]})
-
-    # Add file-level optional params
-    if "page_ranges" in optional_params:
-        files_payload[0]["page_ranges"] = optional_params["page_ranges"]
-    if "is_ocr" in optional_params:
-        files_payload[0]["is_ocr"] = optional_params["is_ocr"]
-
-    # Step 1: Get upload URL
-    headers = get_headers(token)
-    print(f"[File Mode] Requesting upload URL...")
-    result = _check_response(
-        make_request_with_retry("POST", API_V4_FILE_URLS_BATCH, headers=headers, json=payload),
-        context="get upload URL"
-    )
-
-    batch_id = result["data"]["batch_id"]
-    upload_url = result["data"]["file_urls"][0]
-    print(f"[File Mode] Got upload URL. Batch ID: {batch_id}")
-
-    # Step 2: Upload file
-    print(f"[File Mode] Uploading file...")
-    with open(file_path, "rb") as f:
-        upload_response = make_request_with_retry("PUT", upload_url, data=f)
-
-    if upload_response.status_code != 200:
-        msg = f"Error: Failed to upload file. Status: {upload_response.status_code}"
-        print(msg)
-        if upload_response.text:
-            print(f"Response: {upload_response.text[:500]}")
-        raise MinerUError(msg)
-
-    print(f"[File Mode] File uploaded successfully.")
-
-    # Step 3: Poll for results
-    return poll_batch_results(batch_id, token, filename, output_dir=output_dir)
-
-
-def submit_url_task(url, token, optional_params):
-    """
-    Submit URL for extraction via POST /api/v4/extract/task/batch.
-    Returns batch_id.
-    """
-    headers = get_headers(token)
-    data_id = str(uuid.uuid4())[:8]
-
-    # Determine model version from URL
-    model_version = determine_model_version(url, is_url=True)
-
-    # Build request payload
-    payload = {
-        "files": [{"url": url, "data_id": data_id}],
-        "model_version": model_version
-    }
-    payload.update({k: v for k, v in optional_params.items() if k in [
-        "enable_formula", "enable_table", "language", "extra_formats", "no_cache", "cache_tolerance"
-    ]})
-
-    result = _check_response(
-        make_request_with_retry("POST", API_V4_EXTRACT_TASK_BATCH, headers=headers, json=payload),
-        context="submit URL task"
-    )
-
-    batch_id = result["data"]["batch_id"]
-    return batch_id
-
-
-def url_mode(url, token, optional_params, output_dir=None):
-    """
-    Handle URL mode.
-    1. Submit URL via POST /api/v4/extract/task/batch
-    2. Poll for results via GET /api/v4/extract-results/batch/{batch_id}
-    3. Download zip, extract full.md, save it
-    """
-    print(f"[URL Mode] Processing: {url}")
-
-    # Submit URL task
-    batch_id = submit_url_task(url, token, optional_params)
-    print(f"[URL Mode] Batch ID: {batch_id}")
-
-    # Poll for results
-    filename = url.split("/")[-1].split("?")[0] if "/" in url else url
-    return poll_batch_results(batch_id, token, filename, output_dir=output_dir)
-
-
-def poll_batch_results(batch_id, token, filename, timeout=DEFAULT_TIMEOUT, output_dir=None):
-    """
-    Poll for batch results via GET /api/v4/extract-results/batch/{batch_id}.
-    """
-    headers = get_headers(token)
-    url = API_V4_EXTRACT_RESULTS_BATCH.format(batch_id=batch_id)
-
-    print(f"[Batch Mode] Polling batch: {batch_id}")
-    return _poll_batch(url, headers, timeout, filename, token, output_dir=output_dir)
-
-
-def poll_task_results(task_id, token, filename, timeout=DEFAULT_TIMEOUT, output_dir=None):
-    """
-    Poll for single task results via GET /api/v4/extract/task/{task_id}.
-    """
-    headers = get_headers(token)
-    url = API_V4_EXTRACT_TASK_ID.format(task_id=task_id)
-
-    print(f"[Task Mode] Polling task: {task_id}")
-    return _poll_single(url, headers, timeout, filename, token, output_dir=output_dir)
-
-
-def _poll_loop(url, headers, timeout, token, filename, output_dir, extract_state, context="task"):
-    """
-    Core polling loop. Calls extract_state(data, elapsed) on each poll
-    to determine if done, failed, or still waiting.
-
-    Args:
-        extract_state: Callable(data) returning
-            ("done", zip_url | None) | ("failed", err_msg) | ("waiting", display_str) | ("unknown", state_str)
-        filename: Original filename for download_and_extract
-    """
-    session = get_session()
-    start_time = time.time()
-    last_state = None
-    last_progress_update = 0
-
-    while True:
-        elapsed = time.time() - start_time
-        if elapsed >= timeout:
-            print(f"\nError: Polling timed out after {timeout} seconds.")
-            print(f"You can check the task status later.")
-            raise MinerUError(f"Polling timed out after {timeout} seconds.")
-
-        result = _check_response(session.get(url, headers=headers), context=f"poll {context}")
-
-        data = result["data"]
-        action, value = extract_state(data)
-
-        if action == "done":
-            if value:
-                return download_and_extract(value, token, filename, output_dir=output_dir)
-            print("\nError: Task done but no result URL returned.")
-            raise MinerUError("Task done but no result URL returned.")
-        elif action == "failed":
-            print(f"\nError: Task failed. Reason: {value}")
-            raise MinerUError(f"Task failed. Reason: {value}")
-        elif action == "waiting":
-            if value != last_state or elapsed - last_progress_update >= 5:
-                print(f"\r[{format_time(elapsed)}] {value}", end="", flush=True)
-                last_state = value
-                last_progress_update = elapsed
-            time.sleep(POLL_INTERVAL)
-        else:
-            if value:
-                print(f"\nUnknown state: {value}")
-            time.sleep(POLL_INTERVAL)
-
-
-def _poll_batch(url, headers, timeout, filename, token, output_dir=None):
-    """Poll batch results via GET extract-results endpoint."""
-    def extract_state(data):
-        extract_results = data.get("extract_result", [])
-        if not extract_results:
-            return ("waiting", "Waiting for results...")
-
-        file_result = extract_results[0]
-        state = file_result.get("state")
-        file_name = file_result.get("file_name", filename)
-
-        if state == "done":
-            return ("done", file_result.get("full_zip_url"))
-        elif state == "failed":
-            return ("failed", file_result.get("err_msg", "Unknown error"))
-        elif state in ("pending", "running", "converting", "waiting-file"):
-            progress_str = f"{state.capitalize()}"
-            if state == "running" and "extract_progress" in file_result:
-                p = file_result["extract_progress"]
-                progress_str += f" - Extracted {p.get('extracted_pages', 0)}/{p.get('total_pages', '?')} pages"
-            return ("waiting", progress_str)
-        return ("unknown", state)
-
-    return _poll_loop(url, headers, timeout, token, filename, output_dir, extract_state, context="batch")
-
-
-def _poll_single(url, headers, timeout, filename, token, output_dir=None):
-    """Poll single task result via GET extract/task endpoint."""
-    def extract_state(data):
-        state = data.get("state")
-
-        if state == "done":
-            return ("done", data.get("full_zip_url"))
-        elif state == "failed":
-            return ("failed", data.get("err_msg", "Unknown error"))
-        elif state in ("pending", "running", "converting"):
-            progress_str = f"{state.capitalize()}"
-            if state == "running" and "extract_progress" in data:
-                p = data["extract_progress"]
-                progress_str += f" - Extracted {p.get('extracted_pages', 0)}/{p.get('total_pages', '?')} pages"
-            return ("waiting", progress_str)
-        return ("unknown", state)
-
-    return _poll_loop(url, headers, timeout, token, filename, output_dir, extract_state, context="task")
-
-
-def format_time(seconds):
-    """Format seconds to mm:ss."""
-    minutes = int(seconds // 60)
-    secs = int(seconds % 60)
-    return f"{minutes:02d}:{secs:02d}"
-
-
-def download_and_extract(zip_url, token, original_filename, output_dir=None):
-    """
-    Download zip file, extract full.md and images/ folder, save them.
-
-    Uses streaming download to temp file to avoid memory issues with large zips.
-    Rewrites image references in markdown to point to local images directory.
-    """
-    print(f"\n[Download] Downloading result from: {zip_url}")
-
-    # Download the zip file (streaming to temp file)
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    tmp_path = None
-    session = get_session()
-    response_body_prefix = ""
-    try:
-        # Stream download to temp file (write inside the NamedTemporaryFile context)
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
-            tmp_path = tmp.name
-            with session.get(zip_url, headers=headers, timeout=120, stream=True) as response:
-                if response.status_code != 200:
-                    print(f"Error: Failed to download zip. Status: {response.status_code}")
-                    raise MinerUError(f"Failed to download zip. Status: {response.status_code}")
-
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        tmp.write(chunk)
-                        # Capture first chunk for error diagnostics
-                        if not response_body_prefix:
-                            try:
-                                response_body_prefix = chunk[:500].decode("utf-8", errors="replace")
-                            except Exception:
-                                response_body_prefix = f"<binary chunk of {len(chunk)} bytes>"
-
-        print(f"[Download] Downloaded to temp file: {tmp_path}")
-
-        # Extract full.md and images/ folder from zip
-        with zipfile.ZipFile(tmp_path) as zf:
-            # List files in zip for debugging
-            file_list = zf.namelist()
-            print(f"[Extract] Zip contains {len(file_list)} files: {file_list}")
-
-            # Find full.md
-            full_md_name = None
-            for name in file_list:
-                if name.lower() == "full.md":
-                    full_md_name = name
-                    break
-
-            if not full_md_name:
-                print(f"Error: full.md not found in zip. Files: {file_list}")
-                raise MinerUError("full.md not found in zip")
-
-            # Read full.md content
-            with zf.open(full_md_name) as md_file:
-                md_content = md_file.read().decode("utf-8")
-
-            print(f"[Extract] Extracted full.md ({len(md_content)} bytes)")
-
-            # Extract images/ folder if present
-            images_dir = None
-            for name in file_list:
-                if name.startswith("images/") or name.startswith("images\\"):
-                    if images_dir is None:
-                        # Determine output directory for images
-                        if output_dir:
-                            images_dir = os.path.join(output_dir, "images")
-                        else:
-                            images_dir = os.path.join(os.path.dirname(original_filename) or ".", "images")
-                        os.makedirs(images_dir, exist_ok=True)
-                        print(f"[Extract] Extracting images to: {images_dir}")
-
-                    # Extract image file
-                    img_data = zf.read(name)
-                    # Handle both forward slash and backslash paths
-                    img_filename = os.path.basename(name.replace("\\", "/"))
-                    img_path = os.path.join(images_dir, img_filename)
-                    with open(img_path, "wb") as img_file:
-                        img_file.write(img_data)
-
-            if images_dir:
-                image_count = len([n for n in file_list if n.startswith("images/") or n.startswith("images\\")])
-                print(f"[Extract] Extracted {image_count} image(s)")
-
-                # Rewrite image references in markdown to point to local images directory
-                if output_dir:
-                    rel_images_path = os.path.relpath(images_dir, output_dir)
-                else:
-                    md_dir = os.path.dirname(original_filename) if os.path.dirname(original_filename) else "."
-                    rel_images_path = os.path.relpath(images_dir, md_dir)
-
-                # Replace image references like ![...](images/xxx) or ![...](./images/xxx)
-                md_content = re.sub(
-                    r'!\[([^\]]*)\]\((images/[^\)]+)\)',
-                    f'![\\1]({rel_images_path}/\\2)',
-                    md_content
-                )
-                # Also handle markdown that references images/ without the prefix
-                md_content = re.sub(
-                    r'!\[([^\]]*)\]\(\./(images/[^\)]+)\)',
-                    f'![\\1]({rel_images_path}/\\2)',
-                    md_content
-                )
-
-            return md_content, original_filename, output_dir
-
-    except zipfile.BadZipFile:
-        print("Error: Downloaded file is not a valid zip file.")
-        if response_body_prefix:
-            print(f"Content (first 500 chars): {response_body_prefix}")
-        raise MinerUError("Downloaded file is not a valid zip file.")
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-
 # =============================================================================
-# Lightweight Agent API Functions (no token required)
+# Lightweight Agent API Functions
 # =============================================================================
 
-
-def lightweight_parse_by_file(file_path, **kwargs):
-    """
-    Submit a local file to the Lightweight Agent API for parsing.
-
-    Uses signature upload mode:
-    1. POST JSON with file_name to get task_id and signed upload URL
-    2. PUT file content to the signed URL
-
-    No token required.
-
-    Args:
-        file_path: Path to the local file
-        **kwargs: Additional parameters (page_range, enable_formula, etc.)
-
-    Returns:
-        str: task_id for polling
-    """
+def lightweight_parse_by_file(file_path: str, **kwargs) -> str:
+    """Submit a local file to Lightweight Agent API. Returns task_id."""
     filename = os.path.basename(file_path)
 
-    # Step 1: Get signed upload URL
     payload = {"file_name": filename}
     if kwargs:
-        payload.update(kwargs)
+        # Only include params that Agent API supports
+        agent_params = {k: v for k, v in kwargs.items()
+                       if k in ("page_range", "enable_formula", "enable_table", "language")}
+        payload.update(agent_params)
 
     print(f"[Lightweight API] Submitting file: {filename}")
     session = get_session()
-    response = session.post(AGENT_PARSE_FILE, json=payload, timeout=60)
+    response = session.post(APIConfig.AGENT_PARSE_FILE, json=payload, timeout=60)
 
     if response.status_code != 200:
         print(f"Error: Lightweight API request failed. Status: {response.status_code}")
@@ -905,7 +475,6 @@ def lightweight_parse_by_file(file_path, **kwargs):
     file_url = result["data"]["file_url"]
     print(f"[Lightweight API] Task ID: {task_id}")
 
-    # Step 2: PUT file to signed URL
     print(f"[Lightweight API] Uploading file to OSS...")
     with open(file_path, "rb") as f:
         upload_response = session.put(file_url, data=f, timeout=120)
@@ -919,26 +488,18 @@ def lightweight_parse_by_file(file_path, **kwargs):
     return task_id
 
 
-def lightweight_parse_by_url(url, **kwargs):
-    """
-    Submit a URL to the Lightweight Agent API for parsing.
-
-    No token required.
-
-    Args:
-        url: Remote URL to parse
-        **kwargs: Additional parameters (enable_formula, enable_table, etc.)
-
-    Returns:
-        str: task_id for polling
-    """
+def lightweight_parse_by_url(url: str, **kwargs) -> str:
+    """Submit a URL to Lightweight Agent API. Returns task_id."""
     payload = {"url": url}
     if kwargs:
-        payload.update(kwargs)
+        # Only include params that Agent API supports
+        agent_params = {k: v for k, v in kwargs.items()
+                       if k in ("page_range", "enable_formula", "enable_table", "language")}
+        payload.update(agent_params)
 
     print(f"[Lightweight API] Submitting URL: {url}")
     session = get_session()
-    response = session.post(AGENT_PARSE_URL, json=payload, timeout=60)
+    response = session.post(APIConfig.AGENT_PARSE_URL, json=payload, timeout=60)
 
     if response.status_code != 200:
         print(f"Error: Lightweight API URL request failed. Status: {response.status_code}")
@@ -962,18 +523,9 @@ def lightweight_parse_by_url(url, **kwargs):
     return task_id
 
 
-def lightweight_poll_result(task_id, timeout=AGENT_DEFAULT_TIMEOUT):
-    """
-    Poll the Lightweight Agent API for parsing results.
-
-    Args:
-        task_id: Task ID from lightweight_parse_by_file or lightweight_parse_by_url
-        timeout: Maximum polling time in seconds (default: 180)
-
-    Returns:
-        str: Markdown content
-    """
-    url = AGENT_QUERY_RESULT.format(task_id=task_id)
+def lightweight_poll_result(task_id: str, timeout: int = APIConfig.AGENT_DEFAULT_TIMEOUT) -> str:
+    """Poll Lightweight Agent API for parsing results. Returns markdown content."""
+    url = APIConfig.AGENT_QUERY_RESULT.format(task_id=task_id)
     start_time = time.time()
     last_state = None
     last_progress_update = 0
@@ -991,12 +543,11 @@ def lightweight_poll_result(task_id, timeout=AGENT_DEFAULT_TIMEOUT):
             response = session.get(url, timeout=60)
         except requests.exceptions.RequestException as e:
             print(f"\nError: Request failed: {e}")
-            time.sleep(AGENT_POLL_INTERVAL)
+            time.sleep(APIConfig.AGENT_POLL_INTERVAL)
             continue
 
         if response.status_code == 429:
-            # Rate limited - wait and retry
-            wait = AGENT_POLL_INTERVAL * 2
+            wait = APIConfig.AGENT_POLL_INTERVAL * 2
             print(f"\r[{format_time(elapsed)}] Rate limited. Waiting {wait}s... ", end="", flush=True)
             time.sleep(wait)
             continue
@@ -1020,7 +571,6 @@ def lightweight_poll_result(task_id, timeout=AGENT_DEFAULT_TIMEOUT):
         data = result.get("data", {})
         state = data.get("state", "")
 
-        # Update progress display
         if state != last_state or elapsed - last_progress_update >= 5:
             if state:
                 print(f"\r[{format_time(elapsed)}] Lightweight: {state.capitalize()}... ", end="", flush=True)
@@ -1031,16 +581,15 @@ def lightweight_poll_result(task_id, timeout=AGENT_DEFAULT_TIMEOUT):
 
         if state == "done":
             print(f"\r[{format_time(elapsed)}] Done!                              ")
-            # Get markdown content from markdown_url
             markdown_url = data.get("markdown_url")
             if markdown_url:
                 md_response = session.get(markdown_url, timeout=60)
                 if md_response.status_code == 200:
                     return md_response.text
                 else:
-                    print(f"\nError: Failed to download markdown from {markdown_url}, status: {md_response.status_code}")
+                    print(f"\nError: Failed to download markdown, status: {md_response.status_code}")
                     raise MinerUError(f"Failed to download markdown from {markdown_url}")
-            # Fallback: try direct markdown fields
+
             markdown = (
                 data.get("markdown") or
                 data.get("result", {}).get("markdown") or
@@ -1052,219 +601,473 @@ def lightweight_poll_result(task_id, timeout=AGENT_DEFAULT_TIMEOUT):
                 print(f"Response data keys: {list(data.keys())}")
                 raise MinerUError("Task done but no markdown content found in response.")
             return markdown
+
         elif state == "failed":
             print(f"\nError: Task failed. Reason: {data.get('err_msg', 'Unknown error')}")
             raise MinerUError(f"Task failed. Reason: {data.get('err_msg', 'Unknown error')}")
+
         elif state in ("pending", "running", "converting", "waiting-file", "uploading"):
-            time.sleep(AGENT_POLL_INTERVAL)
+            time.sleep(APIConfig.AGENT_POLL_INTERVAL)
         else:
             if state:
                 print(f"\nUnknown state: {state}")
-            time.sleep(AGENT_POLL_INTERVAL)
+            time.sleep(APIConfig.AGENT_POLL_INTERVAL)
 
 
-def lightweight_file_mode(file_path, optional_params, output_dir=None):
-    """
-    Handle lightweight API file mode end-to-end: upload, poll, return markdown.
-
-    Returns:
-        tuple: (markdown_content, original_filename, output_dir)
-    """
-    # Normalize Precision API params to Agent API format
-    agent_params = _normalize_optional_params_for_agent(optional_params)
-    task_id = lightweight_parse_by_file(file_path, **agent_params)
+def lightweight_file_mode(file_path: str, optional_params: dict, output_dir: Optional[str] = None) -> tuple:
+    """Handle lightweight API file mode end-to-end."""
+    task_id = lightweight_parse_by_file(file_path, **optional_params)
     md_content = lightweight_poll_result(task_id)
     filename = os.path.basename(file_path)
     return md_content, filename, output_dir
 
 
-def lightweight_url_mode(url, optional_params, output_dir=None):
-    """
-    Handle lightweight API URL mode end-to-end: submit, poll, return markdown.
-
-    Returns:
-        tuple: (markdown_content, original_filename, output_dir)
-    """
-    # Normalize Precision API params to Agent API format
-    agent_params = _normalize_optional_params_for_agent(optional_params)
-    task_id = lightweight_parse_by_url(url, **agent_params)
+def lightweight_url_mode(url: str, optional_params: dict, output_dir: Optional[str] = None) -> tuple:
+    """Handle lightweight API URL mode end-to-end."""
+    task_id = lightweight_parse_by_url(url, **optional_params)
     md_content = lightweight_poll_result(task_id)
     filename = url.split("/")[-1].split("?")[0]
     return md_content, filename, output_dir
 
 
-def _normalize_optional_params_for_agent(params):
-    """
-    Normalize optional params from Precision API format to Agent API format.
+# =============================================================================
+# Precision API Functions
+# =============================================================================
 
-    - page_ranges (Precision) → page_range (Agent), single range only
-    """
-    agent_params = dict(params)
-    if "page_ranges" in agent_params:
-        agent_params["page_range"] = normalize_page_range_for_agent(agent_params.pop("page_ranges"))
-    return agent_params
+def get_headers(token: str) -> dict:
+    """Get headers with authorization."""
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
 
 
-def parse_with_auto_routing(file_path_or_url, token, optional_params,
-                            is_url=False, force_precision=False, output_dir=None):
-    """
-    Main routing function that automatically selects between Lightweight Agent API
-    and Precision API based on file characteristics.
+def download_and_extract(
+    zip_url: str, token: str, original_filename: str,
+    output_dir: Optional[str] = None
+) -> tuple:
+    """Download zip, extract full.md and images/, rewrite paths. Returns (md_content, filename, output_dir)."""
+    print(f"\n[Download] Downloading result from: {zip_url}")
 
-    Lightweight API (no token needed):
-      - File size ≤ 10 MB AND page count ≤ 20 AND supported type
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    tmp_path = None
+    session = get_session()
+    response_body_prefix = ""
 
-    Precision API (token needed):
-      - File size > 10 MB OR page count > 20 OR unsupported type OR URL mode
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
+            tmp_path = tmp.name
+            with session.get(zip_url, headers=headers, timeout=120, stream=True) as response:
+                if response.status_code != 200:
+                    print(f"Error: Failed to download zip. Status: {response.status_code}")
+                    raise MinerUError(f"Failed to download zip. Status: {response.status_code}")
 
-    Args:
-        file_path_or_url: Path to local file or remote URL
-        token: MinerU API token (can be None if lightweight API is used)
-        optional_params: Dict of optional parameters
-        is_url: Whether the input is a URL
-        force_precision: Force use of Precision API
-        output_dir: Output directory for results
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        tmp.write(chunk)
+                        if not response_body_prefix:
+                            try:
+                                response_body_prefix = chunk[:500].decode("utf-8", errors="replace")
+                            except Exception:
+                                response_body_prefix = f"<binary chunk of {len(chunk)} bytes>"
 
-    Returns:
-        tuple: (markdown_content, original_filename, output_dir)
-    """
-    if is_url:
-        # URLs: direct file URLs (pdf, png, etc.) → Precision API only
-        # Article URLs (no file extension, or .html/.htm) → try Lightweight API first, fallback Precision
-        if force_precision or _url_has_file_extension(file_path_or_url):
-            print(f"[Route] Using Precision API (URL mode)")
-            return url_mode(file_path_or_url, token, optional_params, output_dir=output_dir)
+        print(f"[Download] Downloaded to temp file: {tmp_path}")
+
+        with zipfile.ZipFile(tmp_path) as zf:
+            file_list = zf.namelist()
+            print(f"[Extract] Zip contains {len(file_list)} files: {file_list}")
+
+            full_md_name = None
+            for name in file_list:
+                if name.lower() == "full.md":
+                    full_md_name = name
+                    break
+
+            if not full_md_name:
+                print(f"Error: full.md not found in zip. Files: {file_list}")
+                raise MinerUError("full.md not found in zip")
+
+            with zf.open(full_md_name) as md_file:
+                md_content = md_file.read().decode("utf-8")
+
+            print(f"[Extract] Extracted full.md ({len(md_content)} bytes)")
+
+            images_dir = None
+            for name in file_list:
+                if name.startswith("images/") or name.startswith("images\\"):
+                    if images_dir is None:
+                        if output_dir:
+                            images_dir = os.path.join(output_dir, "images")
+                        else:
+                            images_dir = os.path.join(os.path.dirname(original_filename) or ".", "images")
+                        os.makedirs(images_dir, exist_ok=True)
+                        print(f"[Extract] Extracting images to: {images_dir}")
+
+                    img_data = zf.read(name)
+                    img_filename = os.path.basename(name.replace("\\", "/"))
+                    img_path = os.path.join(images_dir, img_filename)
+                    with open(img_path, "wb") as img_file:
+                        img_file.write(img_data)
+
+            if images_dir:
+                image_count = len([n for n in file_list if n.startswith("images/") or n.startswith("images\\")])
+                print(f"[Extract] Extracted {image_count} image(s)")
+
+                if output_dir:
+                    rel_images_path = os.path.relpath(images_dir, output_dir)
+                else:
+                    md_dir = os.path.dirname(original_filename) if os.path.dirname(original_filename) else "."
+                    rel_images_path = os.path.relpath(images_dir, md_dir)
+
+                md_content = re.sub(
+                    r'!\[([^\]]*)\]\((?:\./)?(images/[^\)]+)\)',
+                    f'![\\1]({rel_images_path}/\\2)',
+                    md_content
+                )
+
+            return md_content, original_filename, output_dir
+
+    except zipfile.BadZipFile:
+        print("Error: Downloaded file is not a valid zip file.")
+        if response_body_prefix:
+            print(f"Content (first 500 chars): {response_body_prefix}")
+        raise MinerUError("Downloaded file is not a valid zip file.")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def upload_file_mode(
+    file_path: str, token: str, optional_params: dict,
+    output_dir: Optional[str] = None, timeout: int = APIConfig.DEFAULT_TIMEOUT
+) -> tuple:
+    """Handle file upload mode: get upload URL, PUT file, poll results."""
+    issues = validate_file_for_api(file_path)
+    if issues:
+        for issue in issues:
+            print(f"  [Warning] {issue}")
+        if any("exceeds" in i for i in issues):
+            print("  Aborting due to limit violations.")
+            raise MinerUError("; ".join(issues))
+
+    filename = os.path.basename(file_path)
+    data_id = str(uuid.uuid4())[:8]
+
+    print(f"[File Mode] Processing: {filename}")
+    print(f"[File Mode] Data ID: {data_id}")
+
+    model_version = determine_model_version(filename)
+    print(f"[File Mode] Model version: {model_version}")
+
+    files_payload = [{"name": filename, "data_id": data_id}]
+    payload = {
+        "files": files_payload,
+        "model_version": model_version
+    }
+    payload.update({k: v for k, v in optional_params.items() if k in [
+        "enable_formula", "enable_table", "language", "extra_formats"
+    ]})
+
+    if "page_ranges" in optional_params:
+        files_payload[0]["page_ranges"] = optional_params["page_ranges"]
+    if "is_ocr" in optional_params:
+        files_payload[0]["is_ocr"] = optional_params["is_ocr"]
+
+    headers = get_headers(token)
+    print(f"[File Mode] Requesting upload URL...")
+    result = _check_response(
+        make_request_with_retry("POST", APIConfig.API_V4_FILE_URLS_BATCH, headers=headers, json=payload),
+        context="get upload URL"
+    )
+
+    batch_id = result["data"]["batch_id"]
+    upload_url = result["data"]["file_urls"][0]
+    print(f"[File Mode] Got upload URL. Batch ID: {batch_id}")
+
+    print(f"[File Mode] Uploading file...")
+    with open(file_path, "rb") as f:
+        upload_response = make_request_with_retry("PUT", upload_url, data=f)
+
+    if upload_response.status_code != 200:
+        msg = f"Error: Failed to upload file. Status: {upload_response.status_code}"
+        print(msg)
+        if upload_response.text:
+            print(f"Response: {upload_response.text[:500]}")
+        raise MinerUError(msg)
+
+    print(f"[File Mode] File uploaded successfully.")
+    return poll_batch_results(batch_id, token, filename, timeout=timeout, output_dir=output_dir)
+
+
+def submit_single_url_task(url: str, token: str, optional_params: dict) -> str:
+    """Submit a single URL for extraction. Returns task_id."""
+    headers = get_headers(token)
+    model_version = determine_model_version(url, is_url=True)
+
+    payload = {
+        "url": url,
+        "model_version": model_version
+    }
+    payload.update({k: v for k, v in optional_params.items() if k in [
+        "enable_formula", "enable_table", "language", "extra_formats", "no_cache", "cache_tolerance"
+    ]})
+
+    result = _check_response(
+        make_request_with_retry("POST", APIConfig.API_V4_EXTRACT_TASK, headers=headers, json=payload),
+        context="submit URL task"
+    )
+
+    task_id = result["data"]["task_id"]
+    return task_id
+
+
+def submit_url_task(url: str, token: str, optional_params: dict) -> str:
+    """Submit URL for extraction. Returns batch_id."""
+    headers = get_headers(token)
+    data_id = str(uuid.uuid4())[:8]
+    model_version = determine_model_version(url, is_url=True)
+
+    payload = {
+        "files": [{"url": url, "data_id": data_id}],
+        "model_version": model_version
+    }
+    payload.update({k: v for k, v in optional_params.items() if k in [
+        "enable_formula", "enable_table", "language", "extra_formats", "no_cache", "cache_tolerance"
+    ]})
+
+    result = _check_response(
+        make_request_with_retry("POST", APIConfig.API_V4_EXTRACT_TASK_BATCH, headers=headers, json=payload),
+        context="submit URL task"
+    )
+
+    batch_id = result["data"]["batch_id"]
+    return batch_id
+
+
+def poll_single_task(
+    task_id: str, token: str, filename: str,
+    timeout: int = APIConfig.DEFAULT_TIMEOUT, output_dir: Optional[str] = None
+) -> tuple:
+    """Poll for single task results. Returns (md_content, filename, output_dir)."""
+    headers = get_headers(token)
+    url = APIConfig.API_V4_EXTRACT_TASK_ID.format(task_id=task_id)
+
+    print(f"[Single Task Mode] Polling task: {task_id}")
+    return _poll_single(url, headers, timeout, filename, token, output_dir=output_dir)
+
+
+def _poll_single(
+    url: str, headers: dict, timeout: int,
+    filename: str, token: str, output_dir: Optional[str]
+) -> tuple:
+    """Poll single task results. Returns (md_content, filename, output_dir)."""
+    session = get_session()
+    start_time = time.time()
+    last_state = None
+    last_progress_update = 0
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed >= timeout:
+            print(f"\nError: Polling timed out after {timeout} seconds.")
+            raise MinerUError(f"Polling timed out after {timeout} seconds.")
+
+        result = _check_response(session.get(url, headers=headers), context="poll task")
+
+        data = result.get("data", {})
+        state = data.get("state", "")
+
+        if state != last_state or elapsed - last_progress_update >= 5:
+            if state:
+                print(f"\r[{format_time(elapsed)}] {state.capitalize()}... ", end="", flush=True)
+            else:
+                print(f"\r[{format_time(elapsed)}] Waiting... ", end="", flush=True)
+            last_state = state
+            last_progress_update = elapsed
+
+        if state == "done":
+            print(f"\r[{format_time(elapsed)}] Done!                              ")
+            full_zip_url = data.get("full_zip_url")
+            if full_zip_url:
+                return download_and_extract(full_zip_url, token, filename, output_dir=output_dir)
+            # Check for error code in response
+            err_code = data.get("err_code") or data.get("err")
+            if err_code:
+                raise MinerUError(f"Task failed with error code: {err_code}")
+            raise MinerUError("Task done but no full_zip_url returned.")
+
+        elif state == "failed":
+            err_msg = data.get("err_msg", "Unknown error")
+            print(f"\nError: Task failed. Reason: {err_msg}")
+            raise MinerUError(f"Task failed. Reason: {err_msg}")
+
+        elif state in ("pending", "running", "converting", "waiting-file", "uploading"):
+            time.sleep(APIConfig.POLL_INTERVAL)
         else:
-            print(f"[Route] Attempting Lightweight API for article URL...")
-            try:
-                result = lightweight_url_mode(file_path_or_url, optional_params, output_dir=output_dir)
-                print(f"[Route] Lightweight API succeeded")
-                return result
-            except MinerUError as e:
-                print(f"[Route] Lightweight API failed: {e}")
-                print(f"[Route] Falling back to Precision API...")
-                if token is None:
-                    token = get_token()
-                return url_mode(file_path_or_url, token, optional_params, output_dir=output_dir)
+            if state:
+                print(f"\nUnknown state: {state}")
+            time.sleep(APIConfig.POLL_INTERVAL)
 
-    # File mode - use routing decision helper
+
+def url_mode(
+    url: str, token: str, optional_params: dict,
+    output_dir: Optional[str] = None, timeout: int = APIConfig.DEFAULT_TIMEOUT
+) -> tuple:
+    """Handle URL mode: submit URL, poll results."""
+    print(f"[URL Mode] Processing: {url}")
+
+    # Article URLs (no file extension) use single task endpoint for reliability
+    if not _url_has_file_extension(url):
+        print("[URL Mode] Using single task endpoint for article URL")
+        task_id = submit_single_url_task(url, token, optional_params)
+        print(f"[URL Mode] Task ID: {task_id}")
+        filename = url.split("/")[-1].split("?")[0] if "/" in url else url
+        return poll_single_task(task_id, token, filename, timeout=timeout, output_dir=output_dir)
+    else:
+        # File URLs use batch endpoint
+        batch_id = submit_url_task(url, token, optional_params)
+        print(f"[URL Mode] Batch ID: {batch_id}")
+        filename = url.split("/")[-1].split("?")[0] if "/" in url else url
+        return poll_batch_results(batch_id, token, filename, timeout=timeout, output_dir=output_dir)
+
+
+def poll_batch_results(
+    batch_id: str, token: str, filename: str,
+    timeout: int = APIConfig.DEFAULT_TIMEOUT, output_dir: Optional[str] = None
+) -> tuple:
+    """Poll for batch results. Returns (md_content, filename, output_dir)."""
+    headers = get_headers(token)
+    url = APIConfig.API_V4_EXTRACT_RESULTS_BATCH.format(batch_id=batch_id)
+
+    print(f"[Batch Mode] Polling batch: {batch_id}")
+    return _poll_batch(url, headers, timeout, filename, token, output_dir=output_dir)
+
+
+def _poll_loop(
+    url: str, headers: dict, timeout: int, token: str,
+    filename: str, output_dir: Optional[str],
+    extract_state, context: str = "task"
+) -> tuple:
+    """Core polling loop. Returns (md_content, filename, output_dir)."""
+    session = get_session()
+    start_time = time.time()
+    last_state = None
+    last_progress_update = 0
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed >= timeout:
+            print(f"\nError: Polling timed out after {timeout} seconds.")
+            raise MinerUError(f"Polling timed out after {timeout} seconds.")
+
+        result = _check_response(session.get(url, headers=headers), context=f"poll {context}")
+
+        data = result["data"]
+        action, value = extract_state(data)
+
+        if action == "done":
+            if value:
+                return download_and_extract(value, token, filename, output_dir=output_dir)
+            print("\nError: Task done but no result URL returned.")
+            raise MinerUError("Task done but no result URL returned.")
+        elif action == "failed":
+            print(f"\nError: Task failed. Reason: {value}")
+            raise MinerUError(f"Task failed. Reason: {value}")
+        elif action == "waiting":
+            if value != last_state or elapsed - last_progress_update >= 5:
+                print(f"\r[{format_time(elapsed)}] {value}", end="", flush=True)
+                last_state = value
+                last_progress_update = elapsed
+            time.sleep(APIConfig.POLL_INTERVAL)
+        else:
+            if value:
+                print(f"\nUnknown state: {value}")
+            time.sleep(APIConfig.POLL_INTERVAL)
+
+
+def _poll_batch(
+    url: str, headers: dict, timeout: int,
+    filename: str, token: str, output_dir: Optional[str] = None
+) -> tuple:
+    """Poll batch results. Returns (md_content, filename, output_dir)."""
+    def extract_state(data):
+        extract_results = data.get("extract_result", [])
+        if not extract_results:
+            return ("waiting", "Waiting for results...")
+
+        file_result = extract_results[0]
+        state = file_result.get("state")
+        file_name = file_result.get("file_name", filename)
+
+        if state == "done":
+            return ("done", file_result.get("full_zip_url"))
+        elif state == "failed":
+            return ("failed", file_result.get("err_msg", "Unknown error"))
+        elif state in ("pending", "running", "converting", "waiting-file"):
+            progress_str = f"{state.capitalize()}"
+            if state == "running" and "extract_progress" in file_result:
+                p = file_result["extract_progress"]
+                progress_str += f" - Extracted {p.get('extracted_pages', 0)}/{p.get('total_pages', '?')} pages"
+            return ("waiting", progress_str)
+        return ("unknown", state)
+
+    return _poll_loop(url, headers, timeout, token, filename, output_dir, extract_state, context="batch")
+
+
+# =============================================================================
+# Auto-Routing Business Logic
+# =============================================================================
+
+def parse_with_auto_routing(
+    file_path_or_url: str,
+    token: Optional[str],
+    optional_params: dict,
+    is_url: bool = False,
+    force_precision: bool = False,
+    output_dir: Optional[str] = None,
+    timeout: int = APIConfig.DEFAULT_TIMEOUT
+) -> tuple:
+    """Main routing function that auto-selects between Lightweight and Precision API."""
+    if is_url:
+        # Article URLs (no file extension) use Precision API directly - Agent API doesn't support HTML
+        # Direct file URLs use Precision API only
+        if not _url_has_file_extension(file_path_or_url):
+            print(f"[Route] Using Precision API (article URL)")
+            if token is None:
+                token = get_token()
+            return url_mode(file_path_or_url, token, optional_params, output_dir=output_dir, timeout=timeout)
+        elif force_precision:
+            print(f"[Route] Using Precision API (forced)")
+            return url_mode(file_path_or_url, token, optional_params, output_dir=output_dir, timeout=timeout)
+        else:
+            print(f"[Route] Using Precision API (file URL)")
+            return url_mode(file_path_or_url, token, optional_params, output_dir=output_dir, timeout=timeout)
+
     api_type, reason = get_routing_decision(file_path_or_url, force_precision)
     print(f"[Route] Using {'Precision' if api_type == 'precision' else 'Lightweight'} API ({reason})")
 
     if api_type == 'lightweight':
         return lightweight_file_mode(file_path_or_url, optional_params, output_dir=output_dir)
     else:
-        return upload_file_mode(file_path_or_url, token, optional_params, output_dir=output_dir)
+        return upload_file_mode(file_path_or_url, token, optional_params, output_dir=output_dir, timeout=timeout)
 
 
-def extract_title(md_content):
-    """
-    Extract the first level-1 heading (# ) from markdown content to use as filename.
-
-    Returns:
-        str or None: Sanitized title suitable for use as filename, or None if no heading found.
-    """
-    match = re.search(r'^#\s+(.+)$', md_content, re.MULTILINE)
-    if match:
-        title = match.group(1).strip()
-        # Remove or replace characters invalid in filenames
-        title = re.sub(r'[\\/:*?"<>|]', '_', title)
-        # Remove leading/trailing whitespace and dots
-        title = title.strip().strip('.')
-        # Truncate to reasonable length
-        if len(title) > 100:
-            title = title[:100].rstrip()
-        if not title:
-            return None
-        return title
-    return None
+def get_token() -> str:
+    """Get API token from environment variable."""
+    token = os.environ.get("MINERU_TOKEN")
+    if not token or not token.strip():
+        raise MinerUError("MINERU_TOKEN environment variable is not set or is empty.")
+    return token.strip()
 
 
-def _url_has_file_extension(url):
-    """Check if URL path ends with a recognizable file extension.
-
-    URLs pointing to downloadable documents (PDF, images, Office docs) should
-    keep the URL-derived filename. URLs pointing to web articles or .html/.htm
-    pages should use the document title instead.
-    """
-    parsed = urlparse(url)
-    path = parsed.path.rstrip("/")
-    last_seg = path.split("/")[-1] if "/" in path else ""
-    ext_match = re.search(r'\.([a-zA-Z]{2,5})$', last_seg)
-    if not ext_match:
-        return False
-    ext = ext_match.group(1).lower()
-    # .html/.htm pages are web articles, not direct file downloads
-    download_extensions = {"pdf", "png", "jpg", "jpeg", "jp2", "webp", "gif", "bmp",
-                           "docx", "pptx", "xlsx", "doc", "ppt", "xls"}
-    return ext in download_extensions
-
-
-def _apply_timestamp(output_path):
-    """Prepend current date (YYYY-MM-DD) to the output filename."""
-    date_prefix = datetime.now().strftime("%Y-%m-%d ")
-    parent = os.path.dirname(output_path)
-    basename = os.path.basename(output_path)
-    new_name = date_prefix + basename
-    if parent:
-        return os.path.join(parent, new_name)
-    return new_name
-
-
-def save_markdown(content, output_path):
-    """Save markdown content to file."""
-    # Ensure output directory exists
-    output_dir = os.path.dirname(output_path)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    print(f"[Save] Markdown saved to: {output_path}")
-
-
-def generate_output_filename(input_path, is_url=False, output_dir=None):
-    """Generate output filename from input path or URL."""
-    if is_url:
-        # For URL, extract filename from URL
-        url_part = input_path.split("/")[-1].split("?")[0]
-        if "." in url_part:
-            filename = url_part.rsplit(".", 1)[0] + ".md"
-        else:
-            filename = url_part + ".md"
-    else:
-        # For file path or title, use the base name
-        basename = os.path.basename(input_path)
-        if "." in basename:
-            name_part, _, ext = basename.rpartition(".")
-            # Only strip if the last part looks like a file extension (alphabetic, 2-5 chars)
-            if re.match(r'^[a-zA-Z]{2,5}$', ext):
-                filename = name_part + ".md"
-            else:
-                filename = basename + ".md"
-        else:
-            filename = basename + ".md"
-
-    if output_dir:
-        return os.path.join(output_dir, filename)
-    return filename
-
-
-def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
-    """
-    Upload multiple files in a true v4 batch and poll for ALL results.
-
-    Uses a single /api/v4/file-urls/batch call for all files, uploads each,
-    then polls the single batch_id for all results simultaneously.
-
-    Returns:
-        list of dict: [{"status": "success"|"failed", "file": path, "name": name,
-                        "md": content, "output_dir": dir, "error": str}]
-    """
+def _batch_upload_and_poll(
+    file_paths: list, token: str, optional_params: dict,
+    output_dir: Optional[str], timeout: int = APIConfig.DEFAULT_TIMEOUT
+) -> list:
+    """Upload multiple files in batch and poll for ALL results."""
     if not file_paths:
         return []
 
-    # Validate all files first
     all_valid = True
     for fp in file_paths:
         issues = validate_file_for_api(fp)
@@ -1277,16 +1080,14 @@ def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
     if not all_valid:
         raise MinerUError("Some files exceed API limits. Aborting batch.")
 
-    # Build combined payload
     headers = get_headers(token)
 
-    # All files in a batch must use the same model_version
     model_versions = {determine_model_version(fp) for fp in file_paths}
     if len(model_versions) > 1:
-        # Split by model_version - warn and use the first one's model
         print(f"  [Warning] Mixed file types in batch require different models ({model_versions}). "
               f"Using '{list(model_versions)[0]}' for all.")
     model_version = list(model_versions)[0]
+
     files_data = []
     for fp in file_paths:
         filename = os.path.basename(fp)
@@ -1305,10 +1106,9 @@ def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
         "enable_formula", "enable_table", "language", "extra_formats"
     ]})
 
-    # Get upload URLs for all files at once
     print(f"\n[Batch Upload] Requesting upload URLs for {len(file_paths)} file(s)...")
     result = _check_response(
-        make_request_with_retry("POST", API_V4_FILE_URLS_BATCH, headers=headers, json=payload),
+        make_request_with_retry("POST", APIConfig.API_V4_FILE_URLS_BATCH, headers=headers, json=payload),
         context="batch get upload URLs"
     )
 
@@ -1320,7 +1120,6 @@ def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
 
     print(f"[Batch Upload] Batch ID: {batch_id}")
 
-    # Upload each file to its OSS URL
     for i, fp in enumerate(file_paths):
         filename = os.path.basename(fp)
         print(f"[Batch Upload] Uploading [{i+1}/{len(file_paths)}] {filename}...")
@@ -1336,11 +1135,9 @@ def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
 
     print(f"[Batch Upload] All files uploaded. Polling for results...")
 
-    # Poll the batch results once — get ALL file results
-    url = API_V4_EXTRACT_RESULTS_BATCH.format(batch_id=batch_id)
+    url = APIConfig.API_V4_EXTRACT_RESULTS_BATCH.format(batch_id=batch_id)
     session = get_session()
     start_time = time.time()
-    timeout = DEFAULT_TIMEOUT
 
     while True:
         elapsed = time.time() - start_time
@@ -1353,15 +1150,11 @@ def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
         extract_results = data.get("extract_result", [])
 
         if len(extract_results) < len(file_paths):
-            # Not all files have results yet (still being detected after upload)
             print(f"\r[{format_time(elapsed)}] Waiting for files ({len(extract_results)}/{len(file_paths)})...", end="", flush=True)
-            time.sleep(POLL_INTERVAL)
+            time.sleep(APIConfig.POLL_INTERVAL)
             continue
 
-        # Check if ALL files are done or failed
-        all_done = all(
-            item.get("state") in ("done", "failed") for item in extract_results
-        )
+        all_done = all(item.get("state") in ("done", "failed") for item in extract_results)
         done_count = sum(1 for item in extract_results if item.get("state") == "done")
         total = len(file_paths)
 
@@ -1371,13 +1164,11 @@ def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
             print()
             break
 
-        time.sleep(POLL_INTERVAL)
+        time.sleep(APIConfig.POLL_INTERVAL)
 
-    # Process results for each file
     batch_results = []
     for item in extract_results:
         file_name = item.get("file_name", "unknown")
-        # Find matching original path
         original_path = next((fp for fp in file_paths if os.path.basename(fp) == file_name), file_name)
 
         if item.get("state") == "done":
@@ -1409,21 +1200,18 @@ def _batch_upload_and_poll(file_paths, token, optional_params, output_dir):
     return batch_results
 
 
-def process_batch(file_list, token, optional_params, output_dir, is_url=False, force_precision=False,
-                  use_title_for_url=False, no_save=False, timestamp=False):
-    """
-    Process multiple files or URLs in batch.
-
-    For files, each item is auto-routed to Lightweight or Precision API
-    based on file characteristics. Article URLs try Lightweight API first,
-    falling back to Precision API. File URLs use Precision API directly.
-    """
-    # Validate batch count against API limits
+def process_batch(
+    file_list: list, token: Optional[str], optional_params: dict,
+    output_dir: Optional[str], is_url: bool = False, force_precision: bool = False,
+    use_title_for_url: bool = False, no_save: bool = False, timestamp: bool = False,
+    timeout: int = APIConfig.DEFAULT_TIMEOUT
+) -> list:
+    """Process multiple files or URLs in batch."""
     count_issues = validate_batch_count(len(file_list))
     for issue in count_issues:
         print(f"  [Warning] {issue}")
     if count_issues:
-        file_list = file_list[:API_MAX_BATCH_FILES]
+        file_list = file_list[:APIConfig.MAX_BATCH_FILES]
 
     results = []
     total = len(file_list)
@@ -1432,7 +1220,6 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
     print(f"Batch Processing: {total} item(s)")
     print(f"{'='*50}\n")
 
-    # File mode — all files go through Precision batch upload directly
     if not is_url:
         file_list_str = ", ".join(os.path.basename(f) for f in file_list)
         print(f"  Files: {file_list_str}")
@@ -1440,10 +1227,12 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
         try:
             if token is None:
                 token = get_token()
-            batch_results = _batch_upload_and_poll(file_list, token, optional_params, output_dir)
+            batch_results = _batch_upload_and_poll(file_list, token, optional_params, output_dir, timeout=timeout)
             for i, br in enumerate(batch_results, 1):
                 original_filename = br["name"]
-                output_path = generate_output_filename(original_filename, is_url=False, output_dir=output_dir)
+                output_path = generate_output_filename(original_filename, is_url=False)
+                if output_dir:
+                    output_path = os.path.join(output_dir, output_path)
                 if timestamp:
                     output_path = _apply_timestamp(output_path)
                 if br["status"] == "success":
@@ -1463,7 +1252,6 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
             for fp in file_list:
                 results.append({"status": "failed", "input": fp, "error": str(e)})
 
-    # URL mode — process each URL individually (cannot batch different origins)
     if is_url:
         for i, item in enumerate(file_list, 1):
             print(f"\n[{i}/{total}] Processing: {item}")
@@ -1471,32 +1259,29 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
 
             try:
                 title = None
-                # Article URLs try Lightweight API first, fallback to Precision
                 if not force_precision and not _url_has_file_extension(item):
                     try:
                         md_content, original_filename, _ = lightweight_url_mode(
                             item, optional_params, output_dir=output_dir)
                     except MinerUError:
-                        # Fallback to Precision API
                         if token is None:
                             token = get_token()
                         md_content, original_filename, _ = url_mode(
-                            item, token, optional_params, output_dir=output_dir)
+                            item, token, optional_params, output_dir=output_dir, timeout=timeout)
                 else:
-                    # File URLs always need Precision API
                     if token is None:
                         token = get_token()
                     md_content, original_filename, _ = url_mode(
-                        item, token, optional_params, output_dir=output_dir)
+                        item, token, optional_params, output_dir=output_dir, timeout=timeout)
 
-                # Use document title only for article URLs (no file extension)
                 if use_title_for_url and not _url_has_file_extension(item):
                     title = extract_title(md_content)
                     if title:
                         original_filename = title
 
-                output_path = generate_output_filename(original_filename, is_url=not title, output_dir=output_dir)
-
+                output_path = generate_output_filename(original_filename, is_url=not title)
+                if output_dir:
+                    output_path = os.path.join(output_dir, output_path)
                 if timestamp:
                     output_path = _apply_timestamp(output_path)
 
@@ -1517,7 +1302,6 @@ def process_batch(file_list, token, optional_params, output_dir, is_url=False, f
                 print(f"Error processing {item}: {e}")
                 results.append({"status": "failed", "input": item, "error": str(e)})
 
-    # Print summary
     print(f"\n{'='*50}")
     print(f"Batch Processing Summary")
     print(f"{'='*50}")
@@ -1555,126 +1339,82 @@ Available language codes:
     sys.exit(0)
 
 
+# =============================================================================
+# CLI Entry Point
+# =============================================================================
+
+def build_optional_params(args) -> dict:
+    """Build optional parameters dictionary from command line arguments."""
+    params = {}
+
+    if args.enable_formula is not None:
+        params["enable_formula"] = args.enable_formula
+    if args.enable_table is not None:
+        params["enable_table"] = args.enable_table
+    if args.is_ocr is not None:
+        params["is_ocr"] = args.is_ocr
+    if args.language:
+        params["language"] = args.language
+    if args.page_ranges:
+        params["page_ranges"] = args.page_ranges
+    if args.extra_formats:
+        params["extra_formats"] = args.extra_formats
+    if args.no_cache:
+        params["no_cache"] = args.no_cache
+    if args.cache_tolerance is not None:
+        params["cache_tolerance"] = args.cache_tolerance
+
+    return params
+
+
 def main():
-    # Handle --help-languages before argparse (since mutually exclusive group is required)
     if "--help-languages" in sys.argv:
         show_help_languages()
 
-    # Fix UTF-8 encoding for stdout on Windows
     if sys.platform == "win32":
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(
-        description="Convert files or URLs to markdown using MinerU APIs. "
-                    "Auto-routes between Lightweight Agent API (no token needed) "
-                    "and Precision API (token needed) based on file characteristics.",
+        description="Convert files or URLs to markdown using MinerU APIs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Convert a local file (auto-routed to Lightweight or Precision API)
-  python mineru2md.py --file ./document.pdf
-
-  # Convert a remote URL
-  python mineru2md.py --url https://example.com/document.pdf
-
-  # Specify output file
-  python mineru2md.py --file ./document.pdf --output my_result.md
-
-  # Specify output directory (for batch processing)
-  python mineru2md.py --files file1.pdf file2.pdf --output-dir ./results
-
-  # With optional parameters
-  python mineru2md.py --file ./doc.pdf --enable-formula --enable-table --language en
-  python mineru2md.py --url https://example.com/doc.pdf --page-ranges 1-10,20
-  python mineru2md.py --file ./doc.pdf --extra-formats docx --extra-formats html
-
-  # Force Precision API for lightweight-compatible files
-  python mineru2md.py --file ./small.pdf --force-precision
-
-  # Disable cache
-  python mineru2md.py --url https://example.com/doc.pdf --no-cache
-
-  # Set cache tolerance (seconds)
-  python mineru2md.py --url https://example.com/doc.pdf --cache-tolerance 1800
-
-  # Print markdown to stdout instead of saving to file
-  python mineru2md.py --file ./document.pdf --print
-
-  # Prepend date to output filename
-  python mineru2md.py --file ./document.pdf --timestamp
-
-  # Print with title-based filename for URL (no save)
-  python mineru2md.py --url https://example.com/doc.pdf --print --timestamp
-
-Environment:
-  MINERU_TOKEN - API token for authentication (Bearer token). Only needed for Precision API.
+  python mineru2md.py --file ./document.pdf --output ./output/
+  python mineru2md.py --url https://example.com/document.pdf --output ./output/
+  python mineru2md.py --files file1.pdf file2.pdf --output ./results/
+  python mineru2md.py --file ./doc.pdf --print
         """
     )
 
-    # Input mode (mutually exclusive groups)
     input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument("--file", "-f", help="Path to local file (PDF, DOC, PPT, XLS, images, HTML)")
-    input_group.add_argument("--files", "-F", nargs="+", help="Multiple local files for batch processing")
+    input_group.add_argument("--file", "-f", help="Path to local file")
+    input_group.add_argument("--files", "-F", nargs="+", help="Multiple local files")
     input_group.add_argument("--url", "-u", help="Remote URL to convert")
-    input_group.add_argument("--urls", "-U", nargs="+", help="Multiple URLs for batch processing")
+    input_group.add_argument("--urls", "-U", nargs="+", help="Multiple URLs")
 
-    # Output options
-    parser.add_argument("--output", "-o", help="Output markdown file path (default: <input_name>.md)")
-    parser.add_argument("--output-dir", "-d", help="Output directory for batch processing")
+    parser.add_argument("--output", "-o", help="Output directory (default: current directory)")
 
-    # Optional parameters
-    parser.add_argument("--enable-formula", action="store_true", default=None,
-                        help="Enable formula recognition (default: true)")
-    parser.add_argument("--disable-formula", dest="enable_formula", action="store_false", default=None,
-                        help="Disable formula recognition")
-    parser.add_argument("--enable-table", action="store_true", default=None,
-                        help="Enable table recognition (default: true)")
-    parser.add_argument("--disable-table", dest="enable_table", action="store_false", default=None,
-                        help="Disable table recognition")
-    parser.add_argument("--is-ocr", action="store_true", default=None,
-                        help="Enable OCR (default: false)")
-    parser.add_argument("--language", "-l", default="ch",
-                        help="Document language (default: ch). See --help-languages for values.")
-    parser.add_argument("--page-ranges", "-p", default=None,
-                        help="Page range specification (e.g., '2,4-6' or '1-10')")
-    parser.add_argument("--extra-formats", nargs="+", choices=["docx", "html", "latex"],
-                        help="Additional export formats")
-    parser.add_argument("--no-cache", action="store_true",
-                        help="Bypass cache (default: false)")
-    parser.add_argument("--cache-tolerance", type=int, default=None,
-                        help="Cache tolerance time in seconds (default: 900)")
-
-    # API selection
-    parser.add_argument("--force-precision", action="store_true",
-                        help="Force using Precision API even for lightweight-compatible files")
-
-    # Output options
-    parser.add_argument("--print", action="store_true",
-                        help="Print markdown content to stdout instead of saving to file")
-    parser.add_argument("--timestamp", action="store_true",
-                        help="Prepend current date (YYYY-MM-DD) to output filename")
-
-    # Polling options
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
-                        help=f"Polling timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    parser.add_argument("--enable-formula", action="store_true", default=None)
+    parser.add_argument("--disable-formula", dest="enable_formula", action="store_false", default=None)
+    parser.add_argument("--enable-table", action="store_true", default=None)
+    parser.add_argument("--disable-table", dest="enable_table", action="store_false", default=None)
+    parser.add_argument("--is-ocr", action="store_true", default=None)
+    parser.add_argument("--language", "-l", default="ch")
+    parser.add_argument("--page-ranges", "-p", default=None)
+    parser.add_argument("--extra-formats", nargs="+", choices=["docx", "html", "latex"])
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--cache-tolerance", type=int, default=None)
+    parser.add_argument("--force-precision", action="store_true")
+    parser.add_argument("--print", action="store_true")
+    parser.add_argument("--timestamp", action="store_true")
+    parser.add_argument("--timeout", type=int, default=APIConfig.DEFAULT_TIMEOUT)
 
     args = parser.parse_args()
-
-    # Build optional parameters
     optional_params = build_optional_params(args)
-
-    # Note: Token is now fetched lazily - only when Precision API is actually needed.
-    # Lightweight API does not require a token.
     token = None
 
-    # Determine mode and process
     try:
         if args.files:
-            # Batch file mode
-            if args.output and not args.output_dir:
-                raise MinerUError("--output is only valid for single file. Use --output-dir for batch processing.")
-
-            # Expand directories to supported files
             expanded_files = []
             supported_globs = ("*.pdf", "*.png", "*.jpg", "*.jpeg", "*.jp2", "*.webp", "*.gif", "*.bmp",
                               "*.docx", "*.pptx", "*.xlsx", "*.doc", "*.ppt", "*.xls", "*.html", "*.htm")
@@ -1693,35 +1433,36 @@ Environment:
             args.files = expanded_files
 
             if not args.files:
-                raise MinerUError("No supported files found. Supported types: PDF, images, Word, PowerPoint, Excel, HTML.")
+                raise MinerUError("No supported files found.")
 
-            # Routing + token fetch handled inside process_batch (lazy)
-            process_batch(args.files, token, optional_params, args.output_dir,
+            process_batch(args.files, token, optional_params, args.output,
                           is_url=False, force_precision=args.force_precision,
-                          use_title_for_url=False, no_save=args.print, timestamp=args.timestamp)
+                          use_title_for_url=False, no_save=args.print, timestamp=args.timestamp,
+                          timeout=args.timeout)
 
         elif args.urls:
-            # Batch URL mode - article URLs try Lightweight first
-            if args.output and not args.output_dir:
-                raise MinerUError("--output is only valid for single URL. Use --output-dir for batch processing.")
-            process_batch(args.urls, None, optional_params, args.output_dir, is_url=True,
-                          use_title_for_url=True, no_save=args.print, timestamp=args.timestamp)
+            process_batch(args.urls, None, optional_params, args.output, is_url=True,
+                          use_title_for_url=True, no_save=args.print, timestamp=args.timestamp,
+                          timeout=args.timeout)
 
         elif args.file:
-            # Single file mode - auto-route
-            output_path = args.output if args.output else generate_output_filename(args.file, output_dir=args.output_dir)
-
-            if args.timestamp and not args.output:
+            output_dir = args.output
+            original_filename = generate_output_filename(args.file)
+            if output_dir:
+                output_path = os.path.join(output_dir, original_filename)
+            else:
+                output_path = original_filename
+            if args.timestamp:
                 output_path = _apply_timestamp(output_path)
 
             api_type, reason = get_routing_decision(args.file, args.force_precision)
             print(f"[Route] Using {'Precision' if api_type == 'precision' else 'Lightweight'} API ({reason})")
 
             if api_type == 'lightweight':
-                md_content, original_filename, _ = lightweight_file_mode(args.file, optional_params, output_dir=args.output_dir)
+                md_content, _, _ = lightweight_file_mode(args.file, optional_params, output_dir=output_dir)
             else:
                 token = get_token()
-                md_content, original_filename, _ = upload_file_mode(args.file, token, optional_params, output_dir=args.output_dir)
+                md_content, _, _ = upload_file_mode(args.file, token, optional_params, output_dir=output_dir, timeout=args.timeout)
 
             if args.print:
                 print(f"\n{'='*50}")
@@ -1736,26 +1477,27 @@ Environment:
                 print(f"{'='*50}")
 
         elif args.url:
-            # Single URL mode - auto-routed: article URLs try Lightweight first
-            md_content, original_filename, _ = parse_with_auto_routing(
+            output_dir = args.output
+            md_content, _, _ = parse_with_auto_routing(
                 args.url, token=None, optional_params=optional_params,
                 is_url=True, force_precision=args.force_precision,
-                output_dir=args.output_dir)
+                output_dir=output_dir, timeout=args.timeout)
 
-            if args.output:
-                output_path = args.output
-            else:
-                # Use document title only for article URLs (no file extension)
-                if not _url_has_file_extension(args.url):
-                    title = extract_title(md_content)
-                    if title:
-                        output_path = generate_output_filename(title, is_url=False, output_dir=args.output_dir)
-                    else:
-                        output_path = generate_output_filename(args.url, is_url=True, output_dir=args.output_dir)
+            if not _url_has_file_extension(args.url):
+                title = extract_title(md_content)
+                if title:
+                    original_filename = generate_output_filename(title)
                 else:
-                    output_path = generate_output_filename(args.url, is_url=True, output_dir=args.output_dir)
+                    original_filename = generate_output_filename(args.url, is_url=True)
+            else:
+                original_filename = generate_output_filename(args.url, is_url=True)
 
-            if args.timestamp and not args.output:
+            if output_dir:
+                output_path = os.path.join(output_dir, original_filename)
+            else:
+                output_path = original_filename
+
+            if args.timestamp:
                 output_path = _apply_timestamp(output_path)
 
             if args.print:

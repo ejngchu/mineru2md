@@ -5,202 +5,104 @@ license: MIT
 compatibility: Requires Python 3.8+ and `requests` library. Token needed for files ≥10MB or >20 pages.
 metadata:
   author: mineru2md
-  version: "1.0"
+  version: "2.0"
 ---
 
-# mineru2md Image/File Parser
+# mineru2md
 
-Convert images, PDFs, Office documents, and article URLs to Markdown using [MinerU](https://mineru.net) APIs. Auto-routes between **Lightweight Agent API** (no token, ≤10MB, ≤20 pages) and **Precision API** (token required).
+Convert images, PDFs, Office documents, and article URLs to Markdown using [MinerU](https://mineru.net) APIs.
+
+Auto-routes between **Lightweight API** (no token, ≤10MB, ≤20 pages) and **Precision API** (token required).
 
 ## When This Skill Activates
 
-Activate this skill when the user:
-- Sends an image (PNG, JPG, JPEG, WebP, BMP, GIF) and wants text/markdown extracted
-- Provides a PDF, DOCX, PPTX, XLSX, or HTML file path to convert
-- Pastes a URL to a document/article for extraction
-- Says "extract text", "convert to markdown", "parse this file", "OCR this image"
+- User sends an image or screenshot
+- User provides a file path (PDF, DOCX, PPTX, XLSX, images)
+- User pastes a URL for extraction
+- User says "extract text", "convert to markdown", "parse this"
 
-## Agent Workflow (step-by-step)
+## Quick Start
 
-When activated, follow these steps **in order**:
+```bash
+# Parse file (auto-routes Lightweight → Precision)
+python scripts/mineru2md.py --file ./document.pdf --print
 
-### Step 1: Locate the file
+# Parse URL (article URLs auto-route)
+python scripts/mineru2md.py --url https://example.com/article --print
 
-The user may provide:
-- An **absolute path** (e.g., `C:\Users\name\doc.pdf`)
-- A **relative path** (resolve from current working directory)
-- A **URL** (https://...)
-- An **image attachment** (save to temp file first)
-
-If the user pastes/clips an image directly, save it to a temporary file path first (e.g., using a temp directory).
-
-### Step 2: Check file size and routing
-
-The script auto-routes based on file characteristics:
-
-| Condition | API Used | Token Required |
-|-----------|----------|---------------|
-| File ≤10MB AND ≤20 pages AND supported type | Lightweight API | No |
-| File >10MB OR >20 pages OR unsupported type | Precision API | Yes |
-
-For article URLs (no file extension, `.html`, `.htm`): tries Lightweight API first (no token), falls back to Precision API if it fails.
-
-### Step 3: Get the token (if needed)
-
-The Precision API token can come from **two places** (checked in order):
-
-1. **`assets/config.json`** (project-level) — for local development
-2. **`MINERU_TOKEN` environment variable** — for production/CI
-
-If a token is needed but neither source provides one:
-- Tell the user they need a MinerU Precision API token
-- Ask them to provide it so you can save it to `assets/config.json`
-
-**Important**: Load the token from `assets/config.json` using this structure:
-```json
-{
-  "mineru_token": "eyJ0eXBlIjoiSldUIi..."
-}
+# Batch files (Precision API)
+python scripts/mineru2md.py --files file1.pdf file2.pdf --output ./results/
 ```
 
-### Step 4: Run the script
+## How Auto-Routing Works
 
-**Script location**: `scripts/mineru2md.py` (relative to skill root)
+| File Condition | API Used | Token |
+|----------------|----------|-------|
+| ≤10MB, ≤20 pages, supported type | Lightweight | No |
+| >10MB OR >20 pages | Precision | Yes |
 
-**Basic usage — parse & print to stdout:**
+**Article URLs** (no file extension, `.html`): tries Lightweight first → falls back to Precision if fails.
+
+**Direct file URLs** (`.pdf`, `.doc`, etc.): Precision API only.
+
+## Token Setup
+
+Precision API requires token. Set via `MINERU_TOKEN` environment variable:
+
 ```bash
-python scripts/mineru2md.py --file <path> --print
-```
-
-**With token (set env var before running):**
-```bash
-# Windows PowerShell
-$env:MINERU_TOKEN='your_token'; python scripts/mineru2md.py --file <path> --print
-
 # Linux/macOS/Git Bash
-MINERU_TOKEN='your_token' python scripts/mineru2md.py --file <path> --print
+export MINERU_TOKEN='your_token'
+
+# Windows PowerShell
+$env:MINERU_TOKEN='your_token'
 ```
 
-**Save to directory:**
-```bash
-python scripts/mineru2md.py --file <path> --output-dir ./output
-```
-
-**Batch mode:**
-```bash
-python scripts/mineru2md.py --files file1.pdf file2.pdf --output-dir ./results
-```
-
-**URL mode (article auto-routing):**
-```bash
-# Article URL → tries Lightweight first, Precision fallback
-python scripts/mineru2md.py --url https://example.com/article
-
-# Direct file URL → Precision API only
-python scripts/mineru2md.py --url https://example.com/doc.pdf
-```
-
-### Step 5: Return the result
-
-- If `--print` was used: the markdown content is in stdout — return it to the user
-- If `--output-dir` was used: the markdown file was saved to the output directory
+Token is only needed when:
+- File > 10MB
+- File > 20 pages
+- File is HTML
+- Direct file URL
 
 ## Supported Formats
 
-| Type | Extensions | Lightweight (no token) | Precision (token) |
-|------|-----------|:---------------------:|:-----------------:|
-| Images | `.png`, `.jpg`, `.jpeg`, `.jp2`, `.webp`, `.gif`, `.bmp` | ≤10MB | Any size |
-| PDF | `.pdf` | ≤10MB, ≤20 pages | Any |
-| Word | `.docx` | ≤10MB, ≤20 pages | Any |
-| PowerPoint | `.pptx` | ≤10MB, ≤20 pages | Any |
-| Excel | `.xlsx` | ≤10MB, ≤20 pages | Any |
-| HTML | `.html`, `.htm` | ❌ | Always |
+| Type | Extensions | Lightweight | Precision |
+|------|-----------|:----------:|:---------:|
+| Images | PNG, JPG, WebP, BMP, GIF | ≤10MB | ✓ |
+| PDF | PDF | ≤20 pages | ✓ |
+| Word | DOCX | ≤20 pages | ✓ |
+| PowerPoint | PPTX | ≤20 pages | ✓ |
+| Excel | XLSX | ≤20 pages | ✓ |
+| HTML | HTML, HTM | ✗ | ✓ |
+
+## Core Commands
+
+```bash
+# Single file (output to current directory)
+python scripts/mineru2md.py --file ./doc.pdf
+
+# Single file (output to directory)
+python scripts/mineru2md.py --file ./doc.pdf --output ./output/
+
+# Multiple files (output to directory)
+python scripts/mineru2md.py --files f1.pdf f2.pdf --output ./results/
+
+# Print to stdout
+python scripts/mineru2md.py --file ./doc.pdf --print
+
+# URL (article auto-routes)
+python scripts/mineru2md.py --url https://example.com/article --output ./output/
+```
 
 ## Skill Structure
 
 ```
 ~/.config/opencode/skills/mineru2md/
-├── SKILL.md                  # Skill definition (this file)
+├── SKILL.md
 ├── scripts/
-│   └── mineru2md.py          # Main executable
+│   └── mineru2md.py
 ├── references/
-│   └── python-api.md         # Python API reference
+│   └── python-api.md
 ├── assets/
-│   └── config.json           # Token config (gitignored)
-└── samples/                  # Sample test files
+│   └── config.json
+└── samples/
 ```
-
-## All CLI Commands
-
-### Parse & Print
-```bash
-# Single file
-python scripts/mineru2md.py --file image.png --print
-
-# Batch
-python scripts/mineru2md.py --files img1.png img2.jpg --print
-```
-
-### Save to Directory
-```bash
-python scripts/mineru2md.py --file image.png --output-dir ./output
-python scripts/mineru2md.py --files img1.png img2.jpg --output-dir ./output
-```
-
-### With Optional Flags
-```bash
-python scripts/mineru2md.py --file doc.pdf --enable-formula --enable-table
-python scripts/mineru2md.py --file doc.pdf --language en
-python scripts/mineru2md.py --file doc.pdf --page-ranges 1-10,15,20-25
-python scripts/mineru2md.py --file image.png --is-ocr
-python scripts/mineru2md.py --file doc.pdf --force-precision
-```
-
-### Timestamp Filename
-```bash
-python scripts/mineru2md.py --file image.png --timestamp
-python scripts/mineru2md.py --file image.png --output-dir ./output --timestamp
-```
-
-### URL Mode
-```bash
-# Direct file URL (token required)
-python scripts/mineru2md.py --url https://example.com/doc.pdf
-
-# Article URL (Lightweight first)
-python scripts/mineru2md.py --url https://mp.weixin.qq.com/s/article
-
-# Multiple URLs
-python scripts/mineru2md.py --urls url1.pdf url2.pdf --output-dir ./results
-```
-
-### Batch Mode
-```bash
-python scripts/mineru2md.py --files file1.pdf file2.pdf --output-dir ./results
-```
-
-## Programmatic Python API
-
-For using the skill via Python code (instead of CLI), see:
-
-➡️ [Python API Reference](references/python-api.md)
-
-Key entry points:
-- `safe_parse_image(path, options)` — Parse single file with auto-routing
-- `safe_parse_images(paths, options)` — Parse batch with auto-routing
-- `parse_with_token(path, token, options)` — Parse with user-provided token
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `MINERU_TOKEN` | For ≥10MB or >20 pages | Precision API token (include `Bearer ` prefix) |
-
-## Notes
-
-- **Default behavior**: `--print` (stdout). Omit it to save to file.
-- **Output filename**: Derived from input filename, or document title for article URLs.
-- **Timestamp**: Use `--timestamp` to prepend date to output filename.
-- **Token priority**: `assets/config.json` > `MINERU_TOKEN` env var > prompt user.
-- **Image extraction**: Precision API results may include an `images/` subfolder.
-- **Error handling**: If script fails, check the error output — common issues include token expiry, file not found, or unsupported format.
