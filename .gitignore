@@ -1,23 +1,25 @@
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+dist/
+build/
 
-# Sisyphus workspace
-.sisyphus/
+# Test
+.pytest_cache/
+.coverage
 
-# Keep samples directory structure but exclude files
-samples/*
-!samples/images/
-samples/images/*
-
-# Generated output artifacts
+# Generated output
 images/
 
-# Sensitive config (contains tokens)
+# Sensitive
+.env
 assets/config.json
 
-# Generated test output markdown files (not README, SKILL.md, or references)
-*.md
-!README.md
-!SKILL.md
-!references/*.md
+# NPM packages (not Python related)
+assets/package*.json
+
+# Large sample files (keep structure only)
+assets/samples/

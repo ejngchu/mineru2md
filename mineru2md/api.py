@@ -18,6 +18,7 @@ import uuid
 import zipfile
 from datetime import datetime
 from urllib.parse import urlparse
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -236,6 +237,17 @@ def format_time(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _format_progress(elapsed: float, state: str, last_state: str, last_progress_update: float, prefix: str = "") -> tuple:
+    """Print progress update and return (last_state, last_progress_update)."""
+    if state != last_state or elapsed - last_progress_update >= 5:
+        if state:
+            print(f"\r[{format_time(elapsed)}]{prefix}{state.capitalize()}... ", end="", flush=True)
+        else:
+            print(f"\r[{format_time(elapsed)}] Waiting... ", end="", flush=True)
+        return state, elapsed
+    return last_state, last_progress_update
+
+
 def extract_file_extension(filename: str) -> str:
     """Extract file extension from filename."""
     if "." in filename:
@@ -262,10 +274,10 @@ def get_page_count(file_path: str) -> Optional[int]:
         doc.close()
         return count
     except ImportError:
-        print("  [Warning] PyMuPDF (fitz) not available. Cannot check page count.")
+        print("  [Warning] PyMuPDF (fitz) not available. Page count unknown — will use Precision API.")
         return None
     except Exception as e:
-        print(f"  [Warning] Failed to get page count: {e}")
+        print(f"  [Warning] Failed to get page count ({e}) — will use Precision API.")
         return None
 
 
@@ -529,7 +541,6 @@ def lightweight_poll_result(task_id: str, timeout: int = APIConfig.AGENT_DEFAULT
     start_time = time.time()
     last_state = None
     last_progress_update = 0
-    session = get_session()
 
     print(f"[Lightweight API] Polling task: {task_id}")
 
@@ -540,7 +551,7 @@ def lightweight_poll_result(task_id: str, timeout: int = APIConfig.AGENT_DEFAULT
             raise MinerUError(f"Lightweight API polling timed out after {timeout} seconds.")
 
         try:
-            response = session.get(url, timeout=60)
+            response = make_request_with_retry("GET", url)
         except requests.exceptions.RequestException as e:
             print(f"\nError: Request failed: {e}")
             time.sleep(APIConfig.AGENT_POLL_INTERVAL)
@@ -571,19 +582,14 @@ def lightweight_poll_result(task_id: str, timeout: int = APIConfig.AGENT_DEFAULT
         data = result.get("data", {})
         state = data.get("state", "")
 
-        if state != last_state or elapsed - last_progress_update >= 5:
-            if state:
-                print(f"\r[{format_time(elapsed)}] Lightweight: {state.capitalize()}... ", end="", flush=True)
-            else:
-                print(f"\r[{format_time(elapsed)}] Waiting... ", end="", flush=True)
-            last_state = state
-            last_progress_update = elapsed
+        last_state, last_progress_update = _format_progress(
+            elapsed, state, last_state, last_progress_update, prefix="Lightweight: ")
 
         if state == "done":
             print(f"\r[{format_time(elapsed)}] Done!                              ")
             markdown_url = data.get("markdown_url")
             if markdown_url:
-                md_response = session.get(markdown_url, timeout=60)
+                md_response = make_request_with_retry("GET", markdown_url)
                 if md_response.status_code == 200:
                     return md_response.text
                 else:
@@ -734,7 +740,10 @@ def download_and_extract(
         raise MinerUError("Downloaded file is not a valid zip file.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except OSError as e:
+                print(f"  [Warning] Could not delete temp file {tmp_path}: {e}")
 
 
 def upload_file_mode(
@@ -861,7 +870,6 @@ def _poll_single(
     filename: str, token: str, output_dir: Optional[str]
 ) -> tuple:
     """Poll single task results. Returns (md_content, filename, output_dir)."""
-    session = get_session()
     start_time = time.time()
     last_state = None
     last_progress_update = 0
@@ -872,25 +880,22 @@ def _poll_single(
             print(f"\nError: Polling timed out after {timeout} seconds.")
             raise MinerUError(f"Polling timed out after {timeout} seconds.")
 
-        result = _check_response(session.get(url, headers=headers), context="poll task")
+        result = _check_response(
+            make_request_with_retry("GET", url, headers=headers),
+            context="poll task"
+        )
 
         data = result.get("data", {})
         state = data.get("state", "")
 
-        if state != last_state or elapsed - last_progress_update >= 5:
-            if state:
-                print(f"\r[{format_time(elapsed)}] {state.capitalize()}... ", end="", flush=True)
-            else:
-                print(f"\r[{format_time(elapsed)}] Waiting... ", end="", flush=True)
-            last_state = state
-            last_progress_update = elapsed
+        last_state, last_progress_update = _format_progress(
+            elapsed, state, last_state, last_progress_update)
 
         if state == "done":
             print(f"\r[{format_time(elapsed)}] Done!                              ")
             full_zip_url = data.get("full_zip_url")
             if full_zip_url:
                 return download_and_extract(full_zip_url, token, filename, output_dir=output_dir)
-            # Check for error code in response
             err_code = data.get("err_code") or data.get("err")
             if err_code:
                 raise MinerUError(f"Task failed with error code: {err_code}")
@@ -949,7 +954,6 @@ def _poll_loop(
     extract_state, context: str = "task"
 ) -> tuple:
     """Core polling loop. Returns (md_content, filename, output_dir)."""
-    session = get_session()
     start_time = time.time()
     last_state = None
     last_progress_update = 0
@@ -960,7 +964,10 @@ def _poll_loop(
             print(f"\nError: Polling timed out after {timeout} seconds.")
             raise MinerUError(f"Polling timed out after {timeout} seconds.")
 
-        result = _check_response(session.get(url, headers=headers), context=f"poll {context}")
+        result = _check_response(
+            make_request_with_retry("GET", url, headers=headers),
+            context=f"poll {context}"
+        )
 
         data = result["data"]
         action, value = extract_state(data)
@@ -974,10 +981,8 @@ def _poll_loop(
             print(f"\nError: Task failed. Reason: {value}")
             raise MinerUError(f"Task failed. Reason: {value}")
         elif action == "waiting":
-            if value != last_state or elapsed - last_progress_update >= 5:
-                print(f"\r[{format_time(elapsed)}] {value}", end="", flush=True)
-                last_state = value
-                last_progress_update = elapsed
+            last_state, last_progress_update = _format_progress(
+                elapsed, value, last_state, last_progress_update)
             time.sleep(APIConfig.POLL_INTERVAL)
         else:
             if value:
@@ -1053,11 +1058,44 @@ def parse_with_auto_routing(
 
 
 def get_token() -> str:
-    """Get API token from environment variable."""
+    """Get API token from environment variable or config file.
+
+    Priority:
+    1. MINERU_TOKEN environment variable
+    2. ~/.config/mineru2md/config.json (Linux/macOS)
+    3. %APPDATA%/mineru2md/config.json (Windows)
+    """
+    # First try environment variable
     token = os.environ.get("MINERU_TOKEN")
-    if not token or not token.strip():
-        raise MinerUError("MINERU_TOKEN environment variable is not set or is empty.")
-    return token.strip()
+    if token and token.strip():
+        return token.strip()
+
+    # Then try config file
+    config_path = _get_config_path()
+    if config_path and config_path.exists():
+        try:
+            import json
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                token = config.get("mineru_token") or config.get("token")
+                if token and token.strip():
+                    return token.strip()
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    raise MinerUError(
+        "MINERU_TOKEN environment variable is not set, and no config file found. "
+        f"Set MINERU_TOKEN or create config at {_get_config_path()}"
+    )
+
+
+def _get_config_path() -> Optional[Path]:
+    """Get platform-specific config file path."""
+    if sys.platform == "win32" or os.name == "nt":
+        base = Path(os.environ.get("APPDATA", ""))
+        return base / "mineru2md" / "config.json"
+    else:
+        return Path.home() / ".config" / "mineru2md" / "config.json"
 
 
 def _batch_upload_and_poll(
@@ -1136,7 +1174,6 @@ def _batch_upload_and_poll(
     print(f"[Batch Upload] All files uploaded. Polling for results...")
 
     url = APIConfig.API_V4_EXTRACT_RESULTS_BATCH.format(batch_id=batch_id)
-    session = get_session()
     start_time = time.time()
 
     while True:
@@ -1145,7 +1182,10 @@ def _batch_upload_and_poll(
             print(f"\nError: Batch polling timed out after {timeout} seconds.")
             raise MinerUError(f"Batch polling timed out after {timeout} seconds.")
 
-        result = _check_response(session.get(url, headers=headers), context="batch poll")
+        result = _check_response(
+            make_request_with_retry("GET", url, headers=headers),
+            context="batch poll"
+        )
         data = result["data"]
         extract_results = data.get("extract_result", [])
 
@@ -1367,6 +1407,26 @@ def build_optional_params(args) -> dict:
     return params
 
 
+def validate_args(args) -> None:
+    """Validate CLI arguments. Raises MinerUError on invalid input."""
+    if args.timeout is not None and args.timeout <= 0:
+        raise MinerUError("--timeout must be a positive integer.")
+
+    if args.output and os.path.exists(args.output) and not os.path.isdir(args.output):
+        raise MinerUError(f"--output '{args.output}' is not a directory.")
+
+    if args.page_ranges:
+        page_ranges_pattern = re.compile(r'^\d+(-\d+)?(,\d+(-\d+)?)*$')
+        if not page_ranges_pattern.match(args.page_ranges):
+            raise MinerUError(
+                f"--page-ranges format is invalid: '{args.page_ranges}'. "
+                "Expected format: '1-10,15,20-25'"
+            )
+
+    if args.cache_tolerance is not None and args.cache_tolerance < 0:
+        raise MinerUError("--cache-tolerance must be a non-negative integer.")
+
+
 def main():
     if "--help-languages" in sys.argv:
         show_help_languages()
@@ -1410,6 +1470,7 @@ Examples:
     parser.add_argument("--timeout", type=int, default=APIConfig.DEFAULT_TIMEOUT)
 
     args = parser.parse_args()
+    validate_args(args)
     optional_params = build_optional_params(args)
     token = None
 
