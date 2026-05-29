@@ -4,50 +4,61 @@ Convert PDF, images, Word, PowerPoint, Excel files and URLs to Markdown using [M
 
 Auto-routes between **Lightweight Agent API** (no token, ≤10MB, ≤20 pages) and **Precision API** (token required, larger or complex files).
 
-## Requirements
-
-- Python 3.8+
-- `requests` library
+## Install
 
 ```bash
-pip install requests
+pip install -e .
 ```
 
-Optional (for page count reading in Precision API routing):
-```bash
-pip install PyMuPDF
+After installation, you can use the `mineru2md` command directly.
+
+## Directory Structure
+
+```
+mineru2md/
+├── src/
+│   └── mineru2md/
+│       ├── __init__.py
+│       └── cli.py           # Main CLI script
+├── tests/
+├── skill/
+│   ├── SKILL.md            # Claude Code skill definition
+│   ├── assets/samples/     # Sample files for testing
+│   └── references/         # API reference docs
+├── setup.py
+├── requirements.txt
+└── README.md
 ```
 
 ## Usage
 
 ```bash
-python mineru2md.py -h
-python mineru2md.py --help-languages   # List all supported language codes
+mineru2md --help
+mineru2md --help-languages   # List all supported language codes
 ```
 
 ### Quick Start — Single File
 
 ```bash
 # Lightweight API (no token required) — auto-selected when file ≤10MB and ≤20 pages
-python mineru2md.py --file ./small.pdf
+mineru2md --file ./small.pdf
 
 # Force Precision API (token required) — even for small files
-python mineru2md.py --file ./small.pdf --force-precision
+mineru2md --file ./small.pdf --force-precision
 
 # Precision API (token required) — auto-selected when file >10MB or >20 pages
-python mineru2md.py --file ./large.pdf
+mineru2md --file ./large.pdf
 ```
 
 ### Single URL — Article URLs Auto-Routed (Lightweight First)
 
 ```bash
 # Direct file URL (PDF, image, doc) → Precision API (token required)
-export MINERU_TOKEN='your_token'
-python mineru2md.py --url https://example.com/document.pdf
+mineru2md --url https://example.com/document.pdf
 
 # Article URL (web page, WeChat, etc.) → tries Lightweight API first (no token),
 # falls back to Precision API if needed
-python mineru2md.py --url https://mp.weixin.qq.com/s/article
+mineru2md --url https://mp.weixin.qq.com/s/article
 ```
 
 Article URLs (no file extension or `.html`/`.htm`) automatically:
@@ -58,14 +69,13 @@ Article URLs (no file extension or `.html`/`.htm`) automatically:
 
 ```bash
 # Multiple files — ALL files go through Precision API batch upload (token required)
-# Token is auto-retrieved from MINERU_TOKEN env var if not provided
-python mineru2md.py --files file1.pdf file2.pdf image.png --output ./results/
+mineru2md --files file1.pdf file2.pdf image.png --output ./results/
 
 # Scan a directory for files to process
-python mineru2md.py --files ./pdfs/*.pdf --output ./results/
+mineru2md --files ./pdfs/*.pdf --output ./results/
 
 # Multiple URLs (each processed individually — article URLs try Lightweight first)
-python mineru2md.py --urls url1.pdf url2.pdf --output ./results/
+mineru2md --urls url1.pdf url2.pdf --output ./results/
 ```
 
 > **Note**: `--files` mode always uses Precision API (batch upload in a single API call). For Lightweight API, use `--file` (single file only).
@@ -74,43 +84,73 @@ python mineru2md.py --urls url1.pdf url2.pdf --output ./results/
 
 ```bash
 # Enable formula / table recognition
-python mineru2md.py --file ./doc.pdf --enable-formula --enable-table
+mineru2md --file ./doc.pdf --enable-formula --enable-table
 
 # Disable formula / table recognition
-python mineru2md.py --file ./doc.pdf --disable-formula --disable-table
+mineru2md --file ./doc.pdf --disable-formula --disable-table
 
 # Enable OCR
-python mineru2md.py --file ./doc.pdf --is-ocr
+mineru2md --file ./doc.pdf --is-ocr
 
 # Set document language (default: ch)
-python mineru2md.py --file ./doc.pdf --language en
+mineru2md --file ./doc.pdf --language en
 
 # Extract specific page ranges only (supports comma-separated ranges)
-python mineru2md.py --file ./doc.pdf --page-ranges 1-10,15,20-25
+mineru2md --file ./doc.pdf --page-ranges 1-10,15,20-25
 
 # Request additional export formats
-python mineru2md.py --file ./doc.pdf --extra-formats docx --extra-formats html
+mineru2md --file ./doc.pdf --extra-formats docx --extra-formats html
 
 # Bypass cache
-python mineru2md.py --url https://example.com/doc.pdf --no-cache
+mineru2md --url https://example.com/doc.pdf --no-cache
 
 # Set cache tolerance (seconds)
-python mineru2md.py --url https://example.com/doc.pdf --cache-tolerance 1800
+mineru2md --url https://example.com/doc.pdf --cache-tolerance 1800
 
 # Longer polling timeout (default: 300s)
-python mineru2md.py --file ./doc.pdf --timeout 600
+mineru2md --file ./doc.pdf --timeout 600
 
 # Print markdown to stdout instead of saving to file
-python mineru2md.py --file ./doc.pdf --print
+mineru2md --file ./doc.pdf --print
 
 # Prepend current date (YYYY-MM-DD) to output filename
-python mineru2md.py --file ./doc.pdf --timestamp
+mineru2md --file ./doc.pdf --timestamp
 
 # Combine: print article URL result with timestamp-based filename
-python mineru2md.py --url https://example.com/article --print --timestamp
+mineru2md --url https://example.com/article --print --timestamp
 ```
 
 ## Token Setup
+
+### Token Loading Priority
+
+| Priority | Source | Description |
+|----------|--------|-------------|
+| 1 (highest) | `MINERU_TOKEN` env var | Environment variable |
+| 2 | `~/.config/mineru2md/config.json` | Config file (all platforms) |
+
+### Config File Location
+
+The config file location follows the XDG Base Directory Specification:
+
+- **Linux/macOS**: `~/.config/mineru2md/config.json`
+- **Windows**: `~/.config/mineru2md/config.json` (i.e. `%USERPROFILE%\.config\...`)
+
+The config file can be manually created, or let the program auto-create it on first run.
+
+### Config File Format
+
+```json
+{
+  "mineru_token": ""
+}
+```
+
+- `mineru_token`: Your MinerU API token (get it from [mineru.net](https://mineru.net))
+- If the config file does not exist, running any `mineru2md` command will auto-create it with an empty template
+- You can pre-fill the token value so it's automatically loaded without setting the environment variable
+
+### When Token is Required
 
 Precision API is needed when:
 - File > 10 MB
@@ -121,12 +161,26 @@ Precision API is needed when:
 
 **Article URLs** (web pages, no file extension or `.html`/`.htm`) try **Lightweight API first** (no token). Only fall back to Precision API (token required) if Lightweight fails.
 
+### Setting Token
+
+**Option 1: Environment Variable**
+
 ```bash
+# Linux / macOS / Git Bash
+export MINERU_TOKEN='your_token'
+
 # Windows PowerShell
 $env:MINERU_TOKEN='your_token'
+```
 
-# Linux / macOS
-export MINERU_TOKEN='your_token'
+**Option 2: Config File**
+
+Create or edit `~/.config/mineru2md/config.json`:
+
+```json
+{
+  "mineru_token": "your_token"
+}
 ```
 
 **Obtain a token** from the [MinerU platform](https://mineru.net) — the token must include the `Bearer ` prefix automatically by the script.
@@ -241,7 +295,7 @@ All inputs go through `parse_with_auto_routing()`:
 
 | Error Code | Cause | Recommended Action |
 |-----------|-------|-------------------|
-| Token missing | `MINERU_TOKEN` not set | Set environment variable |
+| Token missing | `MINERU_TOKEN` not set | Set environment variable or create config file |
 | A0202 | Token incorrect | Verify token format (should include `Bearer ` prefix) |
 | A0211 | Token expired | Obtain new token from MinerU |
 | -60005 | File > 200MB | Reduce file size or split |
@@ -292,22 +346,29 @@ md_content, filename, _ = lightweight_file_mode(
 | Excel | `.xlsx` | ✅ ≤10MB, ≤20 pages | ✅ |
 | HTML | `.html, .htm` | ❌ | ✅ |
 
-## OpenCode Skill Integration
+## Claude Code Skill Integration
 
-This project can be used as an [OpenCode](https://github.com/call0n3/opencode) skill for seamless image-to-markdown conversion within the OpenCode assistant.
+This project can be used as a Claude Code skill for seamless image-to-markdown conversion within the Claude Code assistant.
 
-**Skill directory**: `~/.config/opencode/skills/mineru2md/`
+### Skill Directory
 
-**Structure**:
 ```
-~/.config/opencode/skills/mineru2md/
-├── SKILL.md          # Skill definition & user intent mapping
-└── mineru2md.py      # Main script (symlinked or copied from repo)
+skill/
+├── SKILL.md              # Skill definition & user intent mapping
+├── assets/samples/       # Sample files for testing
+└── references/           # API reference documentation
 ```
 
-**Loading the skill**: When you send an image or screenshot and want to extract content as markdown, OpenCode automatically loads the mineru2md skill and routes your request to the appropriate CLI command.
+### Loading the Skill
 
-**Token persistence**: The skill saves your Precision API token to `~/.config/opencode/skills/mineru2md/config.json` so you only need to enter it once.
+After `pip install -e .`, Claude Code can load the skill from the `./skill` directory:
+
+```bash
+# In Claude Code
+/skills add mineru2md ./skill
+```
+
+**Note**: The skill requires `pip install -e .` to be run first, as it imports from the `mineru2md` package.
 
 ---
 

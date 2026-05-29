@@ -3,6 +3,7 @@ from setuptools import setup
 setup(
     name="mineru2md",
     version="2.0",
+    package_dir={"": "src"},
     packages=["mineru2md"],
     install_requires=[
         "requests>=2.28.0",
@@ -12,7 +13,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "mineru2md=mineru2md.api:main",
+            "mineru2md=mineru2md.cli:main",
         ],
     },
     python_requires=">=3.8",
