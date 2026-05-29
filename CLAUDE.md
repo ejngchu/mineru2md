@@ -38,5 +38,28 @@ mineru2md --files f1.pdf f2.pdf --output ./results/
 ## Testing
 
 ```bash
-pytest tests/ -v  # 39 tests
+pytest tests/ -v           # All 39 tests
+pytest tests/test_mineru2md.py::TestExtractFileExtension -v  # Single test class
 ```
+
+## Architecture
+
+The auto-routing decision flow is documented in `README.md` with diagrams. Key logic in `mineru2md/api.py`:
+
+- `is_lightweight_compatible()` — checks file extension, size (≤10MB), and page count (≤20)
+- `get_routing_decision()` — returns `'lightweight'` or `'precision'` with reason
+- `parse_with_auto_routing()` — main entry point that routes based on decision
+- `download_and_extract()` — handles Precision API ZIP output with image path rewriting
+
+## Token Config
+
+Token is loaded from (in priority order):
+1. `MINERU_TOKEN` environment variable
+2. `~/.config/mineru2md/config.json` (Linux/macOS)
+3. `%APPDATA%/mineru2md/config.json` (Windows)
+
+Config file format: `{"mineru_token": "your_token"}` or `{"token": "your_token"}`
+
+## OpenCode Skill Integration
+
+This project can be used as an [OpenCode](https://github.com/call0n3/opencode) skill. The skill directory is `~/.config/opencode/skills/mineru2md/` with `SKILL.md` and `mineru2md.py`. Token persists to `config.json` so it's entered once.

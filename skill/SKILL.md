@@ -40,13 +40,12 @@ This skill activates when the user:
 
 | User says | Action |
 |-----------|--------|
-| 发送图片/截图 | `python scripts/mineru2md.py --file {path} --print` |
-| 发送 PDF 文件路径 | `python scripts/mineru2md.py --file {path} --print` |
-| 发送 URL (文章) | `python scripts/mineru2md.py --url {url} --print` |
-| 发送文件列表 | `python scripts/mineru2md.py --files {paths} --output {dir}/` |
+| 发送图片/截图 | `mineru2md --file {path} --print` |
+| 发送 PDF 文件路径 | `mineru2md --file {path} --print` |
+| 发送 URL (文章) | `mineru2md --url {url} --print` |
+| 发送文件列表 | `mineru2md --files {paths} --output {dir}/` |
 | "提取文字" + 图片 | 识别图片路径，调用 Lightweight API |
 | "转换 markdown" + 文件 | 识别文件路径，自动选择 API |
-| 请求查看 token 状态 | 检查 `assets/config.json` 是否存在有效 token |
 
 ## Auto-Routing Logic
 
@@ -74,7 +73,16 @@ File conditions → Precision API (token required)
 
 ## Token Management
 
-**Token storage**: `assets/config.json` — persists across sessions.
+**Token storage**: `~/.config/mineru2md/config.json` (Linux/macOS) or `%APPDATA%/mineru2md/config.json` (Windows)
+
+**Config file format**:
+```json
+{
+  "mineru_token": "your_token_here"
+}
+```
+
+If config file does not exist, it will be automatically created with an empty template on first use.
 
 **When token is needed**:
 - File > 10MB
@@ -84,7 +92,7 @@ File conditions → Precision API (token required)
 
 **If no token but required**:
 ```
-Ask user: "需要 MinerU Token 来处理大文件。请从 https://mineru.net 获取 token。"
+Ask user: "需要 MinerU Token 来处理大文件。请从 https://mineru.net 获取 token，然后配置到 ~/.config/mineru2md/config.json"
 ```
 
 **Get token**:
@@ -100,45 +108,48 @@ $env:MINERU_TOKEN='your_token'
 
 ```bash
 # Single file — auto-select API
-python scripts/mineru2md.py --file ./doc.pdf --print
+mineru2md --file ./doc.pdf --print
 
 # URL (article auto-routes)
-python scripts/mineru2md.py --url https://example.com/article --print
+mineru2md --url https://example.com/article --print
 
 # Batch files (Precision API)
-python scripts/mineru2md.py --files f1.pdf f2.pdf --output ./results/
+mineru2md --files f1.pdf f2.pdf --output ./results/
 
 # With options
-python scripts/mineru2md.py --file ./doc.pdf --enable-formula --enable-table --language en
+mineru2md --file ./doc.pdf --enable-formula --enable-table --language en
 
 # Page ranges
-python scripts/mineru2md.py --file ./doc.pdf --page-ranges 1-10,15,20-25
+mineru2md --file ./doc.pdf --page-ranges 1-10,15,20-25
 
 # Print instead of save
-python scripts/mineru2md.py --file ./doc.pdf --print
+mineru2md --file ./doc.pdf --print
 ```
 
 ## Skill Structure
 
 ```
-~/.config/opencode/skills/mineru2md/
-├── SKILL.md              # This file
-├── scripts/
-│   └── mineru2md.py     # Main CLI
-├── references/
-│   └── python-api.md    # Python API docs
-├── assets/
-│   └── config.json      # Token storage
-└── tests/
-    ├── __init__.py
-    └── test_mineru2md.py # 39 unit tests
+mineru2md/
+├── src/
+│   └── mineru2md/
+│       ├── __init__.py
+│       └── cli.py              # Main CLI (imported by skill)
+├── skill/
+│   ├── SKILL.md               # This file
+│   ├── assets/samples/         # Sample files for testing
+│   └── references/             # API reference docs
+├── tests/
+├── setup.py
+└── requirements.txt
 ```
+
+**Note**: This skill requires `pip install -e .` to be run first, as it imports from the `mineru2md` package.
 
 ## Error Handling
 
 | Code | Meaning | Action |
 |------|---------|--------|
-| A0202 | Token incorrect | Check token format in config.json |
+| A0202 | Token incorrect | Check token in ~/.config/mineru2md/config.json |
 | A0211 | Token expired | Get new token from MinerU dashboard |
 | -60005 | File > 200MB | Split the file |
 | -60006 | Page count > 200 | Split the PDF |
@@ -147,6 +158,5 @@ python scripts/mineru2md.py --file ./doc.pdf --print
 ## Testing
 
 ```bash
-cd ~/.config/opencode/skills/mineru2md
-pytest tests/ -v  # 39 tests
+pytest tests/ -v  # Run tests
 ```

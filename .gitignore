@@ -16,10 +16,6 @@ images/
 
 # Sensitive
 .env
-assets/config.json
-
-# NPM packages (not Python related)
-assets/package*.json
 
 # Large sample files (keep structure only)
-assets/samples/
+tests/samples/
