@@ -73,12 +73,12 @@ File conditions → Precision API (token required)
 
 ## Token Management
 
-**Token storage**: `~/.config/mineru2md/config.json` (Linux/macOS) or `%APPDATA%/mineru2md/config.json` (Windows)
+**Token storage**: `~/.config/mineru2md/config.json` (all platforms, auto-created)
 
 **Config file format**:
 ```json
 {
-  "mineru_token": "your_token_here"
+  "mineru_token": ""
 }
 ```
 
@@ -136,11 +136,10 @@ mineru2md/
 │       └── cli.py              # Main CLI (imported by skill)
 ├── skill/
 │   ├── SKILL.md               # This file
-│   ├── assets/samples/         # Sample files for testing
-│   └── references/             # API reference docs
+│   └── references/            # API reference docs
 ├── tests/
 ├── setup.py
-└── requirements.txt
+└── README.md
 ```
 
 **Note**: This skill requires `pip install -e .` to be run first, as it imports from the `mineru2md` package.
