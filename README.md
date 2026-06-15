@@ -86,6 +86,18 @@ After `pip install -e .`, add to Claude Code:
 /skills add mineru2md ./skill
 ```
 
+## OpenCode Skill (One-Liner Install)
+
+从 GitHub 仓库 https://github.com/ejngchu/mineru2md 下载代码到本地，识别 SKILL.md 并安装为当前平台的 skill，同时通过 pip install . 安装 CLI 工具，安装完成后删除临时文件。
+
+```bash
+git clone --depth=1 https://github.com/ejngchu/mineru2md /tmp/mineru2md_tmp && \
+mkdir -p ~/.config/opencode/skills/mineru2md && \
+cp -r /tmp/mineru2md_tmp/skill/* ~/.config/opencode/skills/mineru2md/ && \
+cd /tmp/mineru2md_tmp && pip install . && \
+rm -rf /tmp/mineru2md_tmp
+```
+
 ## License
 
 MIT
